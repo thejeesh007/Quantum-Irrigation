@@ -469,7 +469,7 @@ def main():
         lr_pred = lr_model.predict(X_test)
         lr_proba = lr_model.predict_proba(X_test)[:, 1]
         
-        # SVM
+        
         print("Training SVM...")
         svm_model = SVC(random_state=42, probability=True)
         svm_model.fit(X_train, y_train)
