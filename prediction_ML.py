@@ -1,4 +1,4 @@
-"""
+
 
 import numpy as np
 import joblib
@@ -10,8 +10,8 @@ from typing import Tuple, Optional
 class IrrigationPredictor:
     """Quantum-Enhanced Irrigation Prediction System"""
     
-    def __init__(self, model_path: str = "vqc_model.pkl", 
-                 scaler_path: str = "feature_scaler.pkl"):
+    def __init__(self, model_path: str = "quantum_irrigation_model.pkl", 
+                 scaler_path: str = "scaler.pkl"):
         """
         Initialize the irrigation predictor
         
