@@ -465,7 +465,6 @@ def plot_training_progress(vqc_model, save_path=None):
 
 
 def save_models(vqc_model, classical_models):
-    """Save all trained models"""
     print(f"\nSaving Models")
     print("=" * 20)
     
