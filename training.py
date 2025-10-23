@@ -1,11 +1,22 @@
+"""
+Hybrid Quantum-Classical Irrigation Prediction Model
+=====================================================
+This script trains a hybrid model combining:
+1. VQC (Variational Quantum Classifier) for quantum feature extraction
+2. Random Forest on hybrid features (quantum + classical)
+
+Installation:
+    pip install pennylane numpy pandas scikit-learn matplotlib seaborn joblib
+
+Author: Smart Irrigation System
+"""
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score,
                            confusion_matrix, classification_report, roc_auc_score)
@@ -41,10 +52,14 @@ CONFIG = {
     'batch_size': 32,
     'early_stopping_patience': 15,
     
+    # Hybrid model parameters
+    'rf_n_estimators': 100,
+    'rf_max_depth': 10,
+    
     # File paths
     'model_dir': 'models',
     'plots_dir': 'plots',
-    'results_dir': 'results',
+    'hybrid_model_file': 'hybrid_irrigation_model.pkl',
 }
 
 
@@ -101,6 +116,12 @@ class QuantumIrrigationVQC:
         self._feature_encoding(x)
         self._variational_ansatz(weights)
         return qml.expval(qml.PauliZ(0))
+    
+    def _circuit_all_qubits(self, x, weights):
+        """Circuit that returns expectation values from all qubits"""
+        self._feature_encoding(x)
+        self._variational_ansatz(weights)
+        return [qml.expval(qml.PauliZ(i)) for i in range(self.n_qubits)]
     
     def _prediction_from_expectation(self, expectation_val):
         """Convert expectation value [-1, 1] to probability [0, 1]"""
@@ -233,6 +254,27 @@ class QuantumIrrigationVQC:
         
         return self
     
+    def extract_quantum_features(self, X):
+        """Extract quantum features (expectation values from all qubits)"""
+        if not self.is_trained:
+            raise ValueError("VQC must be trained before extracting features")
+        
+        X_scaled = self.scaler.transform(X)
+        quantum_features = []
+        
+        # Create circuit that measures all qubits
+        circuit_all = qml.QNode(self._circuit_all_qubits, self.dev)
+        
+        for x_sample in X_scaled:
+            try:
+                expectations = circuit_all(x_sample, self.weights)
+                quantum_features.append(expectations)
+            except Exception as e:
+                print(f"Feature extraction error: {e}")
+                quantum_features.append([0.0] * self.n_qubits)
+        
+        return np.array(quantum_features)
+    
     def predict_proba(self, X):
         """Predict class probabilities"""
         if not self.is_trained:
@@ -258,6 +300,39 @@ class QuantumIrrigationVQC:
         return (probabilities > 0.5).astype(int)
 
 
+class HybridQuantumClassicalModel:
+    """Hybrid model combining VQC quantum features with Random Forest"""
+    
+    def __init__(self, vqc_model, rf_model, feature_scaler=None):
+        self.vqc_model = vqc_model
+        self.rf_model = rf_model
+        self.feature_scaler = feature_scaler
+        
+    def predict(self, X):
+        """Make predictions using hybrid features"""
+        # Extract quantum features
+        quantum_features = self.vqc_model.extract_quantum_features(X)
+        
+        # Combine with classical features
+        hybrid_features = np.concatenate([X, quantum_features], axis=1)
+        
+        # Scale if scaler exists
+        if self.feature_scaler is not None:
+            hybrid_features = self.feature_scaler.transform(hybrid_features)
+        
+        return self.rf_model.predict(hybrid_features)
+    
+    def predict_proba(self, X):
+        """Predict probabilities using hybrid features"""
+        quantum_features = self.vqc_model.extract_quantum_features(X)
+        hybrid_features = np.concatenate([X, quantum_features], axis=1)
+        
+        if self.feature_scaler is not None:
+            hybrid_features = self.feature_scaler.transform(hybrid_features)
+        
+        return self.rf_model.predict_proba(hybrid_features)
+
+
 def load_dataset(csv_file):
     """Load and preprocess irrigation dataset"""
     print(f"\n{'='*60}")
@@ -266,13 +341,11 @@ def load_dataset(csv_file):
     print(f"File: {csv_file}")
     
     try:
-        # Load CSV
         df = pd.read_csv(csv_file)
         print(f"✓ Dataset loaded successfully")
         print(f"  Shape: {df.shape}")
         print(f"  Columns: {list(df.columns)}")
         
-        # Check required columns
         required_features = CONFIG['feature_columns']
         required_label = CONFIG['label_column']
         
@@ -294,7 +367,6 @@ def load_dataset(csv_file):
                 if count > 0:
                     print(f"  {col}: {count}")
             
-            # Fill missing values
             for col in required_features:
                 if df[col].isnull().sum() > 0:
                     median_val = df[col].median()
@@ -308,11 +380,9 @@ def load_dataset(csv_file):
         else:
             print(f"✓ No missing values")
         
-        # Extract features and labels
         X = df[required_features].values
         y = df[required_label].values
         
-        # Validate labels (must be binary: 0 or 1)
         unique_labels = np.unique(y)
         if not set(unique_labels).issubset({0, 1}):
             print(f"⚠ Warning: Non-binary labels detected: {unique_labels}")
@@ -348,51 +418,91 @@ def load_dataset(csv_file):
         raise
 
 
-def train_classical_models(X_train, y_train):
-    """Train classical ML baseline models"""
+def train_vqc(X_train, y_train, X_val=None, y_val=None):
+    """Train VQC model"""
     print(f"\n{'='*60}")
-    print("TRAINING CLASSICAL MODELS")
+    print("STEP 1: TRAINING VQC (QUANTUM MODEL)")
     print('='*60)
     
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
+    vqc_model = QuantumIrrigationVQC(
+        n_qubits=CONFIG['n_qubits'],
+        n_layers=CONFIG['n_layers'],
+        n_features=CONFIG['n_features'],
+        learning_rate=CONFIG['learning_rate']
+    )
     
-    models = {}
+    vqc_model.fit(X_train, y_train, X_val, y_val, verbose=True)
     
-    # Logistic Regression
-    print("Training Logistic Regression...")
-    lr_model = LogisticRegression(random_state=42, max_iter=1000)
-    lr_model.fit(X_train_scaled, y_train)
-    models['logistic_regression'] = (lr_model, scaler)
-    print("✓ Logistic Regression trained")
-    
-    # SVM
-    print("Training Support Vector Machine...")
-    svm_model = SVC(probability=True, random_state=42, kernel='rbf')
-    svm_model.fit(X_train_scaled, y_train)
-    models['svm'] = (svm_model, scaler)
-    print("✓ SVM trained")
-    
-    # Random Forest
-    print("Training Random Forest...")
-    rf_model = RandomForestClassifier(n_estimators=100, random_state=42)
-    rf_model.fit(X_train, y_train)
-    models['random_forest'] = (rf_model, None)
-    print("✓ Random Forest trained")
-    
-    return models
+    return vqc_model
 
 
-def evaluate_all_models(vqc_model, classical_models, X_test, y_test):
-    """Evaluate and compare all models"""
+def extract_quantum_features(vqc_model, X_data, data_name="data"):
+    """Extract quantum features from VQC"""
     print(f"\n{'='*60}")
-    print("MODEL EVALUATION")
+    print(f"STEP 2: EXTRACTING QUANTUM FEATURES FROM {data_name.upper()}")
+    print('='*60)
+    
+    quantum_features = vqc_model.extract_quantum_features(X_data)
+    
+    print(f"✓ Quantum features extracted")
+    print(f"  Original features shape: {X_data.shape}")
+    print(f"  Quantum features shape: {quantum_features.shape}")
+    print(f"  Quantum features (expectation values from {CONFIG['n_qubits']} qubits)")
+    
+    return quantum_features
+
+
+def train_hybrid_rf(X_train, y_train, quantum_features_train):
+    """Train Random Forest on hybrid features (classical + quantum)"""
+    print(f"\n{'='*60}")
+    print("STEP 3: TRAINING HYBRID RANDOM FOREST")
+    print('='*60)
+    
+    # Combine classical and quantum features
+    hybrid_features = np.concatenate([X_train, quantum_features_train], axis=1)
+    
+    print(f"Hybrid features shape: {hybrid_features.shape}")
+    print(f"  Classical features: {X_train.shape[1]}")
+    print(f"  Quantum features: {quantum_features_train.shape[1]}")
+    print(f"  Total hybrid features: {hybrid_features.shape[1]}")
+    
+    # Optional: Scale hybrid features
+    scaler = StandardScaler()
+    hybrid_features_scaled = scaler.fit_transform(hybrid_features)
+    
+    # Train Random Forest
+    rf_model = RandomForestClassifier(
+        n_estimators=CONFIG['rf_n_estimators'],
+        max_depth=CONFIG['rf_max_depth'],
+        random_state=42,
+        n_jobs=-1
+    )
+    
+    print(f"\nTraining Random Forest...")
+    rf_model.fit(hybrid_features_scaled, y_train)
+    print(f"✓ Random Forest trained successfully")
+    
+    # Feature importances
+    feature_importances = rf_model.feature_importances_
+    n_classical = X_train.shape[1]
+    
+    print(f"\nFeature Importances:")
+    print(f"  Classical features importance: {np.sum(feature_importances[:n_classical]):.4f}")
+    print(f"  Quantum features importance: {np.sum(feature_importances[n_classical:]):.4f}")
+    
+    return rf_model, scaler
+
+
+def evaluate_models(vqc_model, rf_model, feature_scaler, X_test, y_test, quantum_features_test):
+    """Evaluate VQC alone and Hybrid VQC+RF model"""
+    print(f"\n{'='*60}")
+    print("STEP 4: MODEL EVALUATION")
     print('='*60)
     
     results = {}
     
-    # Evaluate VQC
-    print("Evaluating VQC...")
+    # Evaluate VQC alone
+    print("\nEvaluating VQC (Quantum only)...")
     vqc_pred = vqc_model.predict(X_test)
     vqc_prob = vqc_model.predict_proba(X_test)
     
@@ -404,28 +514,23 @@ def evaluate_all_models(vqc_model, classical_models, X_test, y_test):
         'auc': roc_auc_score(y_test, vqc_prob) if len(np.unique(y_test)) > 1 else 0.5
     }
     
-    # Evaluate classical models
-    for name, (model, scaler) in classical_models.items():
-        model_name = name.replace('_', ' ').title()
-        print(f"Evaluating {model_name}...")
-        
-        if scaler is not None:
-            X_test_scaled = scaler.transform(X_test)
-            pred = model.predict(X_test_scaled)
-            prob = model.predict_proba(X_test_scaled)[:, 1]
-        else:
-            pred = model.predict(X_test)
-            prob = model.predict_proba(X_test)[:, 1]
-        
-        results[model_name] = {
-            'accuracy': accuracy_score(y_test, pred),
-            'precision': precision_score(y_test, pred, zero_division=0),
-            'recall': recall_score(y_test, pred, zero_division=0),
-            'f1_score': f1_score(y_test, pred, zero_division=0),
-            'auc': roc_auc_score(y_test, prob) if len(np.unique(y_test)) > 1 else 0.5
-        }
+    # Evaluate Hybrid model
+    print("Evaluating Hybrid VQC+RF...")
+    hybrid_features_test = np.concatenate([X_test, quantum_features_test], axis=1)
+    hybrid_features_test_scaled = feature_scaler.transform(hybrid_features_test)
     
-    # Display comparison table
+    hybrid_pred = rf_model.predict(hybrid_features_test_scaled)
+    hybrid_prob = rf_model.predict_proba(hybrid_features_test_scaled)[:, 1]
+    
+    results['Hybrid VQC+RF'] = {
+        'accuracy': accuracy_score(y_test, hybrid_pred),
+        'precision': precision_score(y_test, hybrid_pred, zero_division=0),
+        'recall': recall_score(y_test, hybrid_pred, zero_division=0),
+        'f1_score': f1_score(y_test, hybrid_pred, zero_division=0),
+        'auc': roc_auc_score(y_test, hybrid_prob) if len(np.unique(y_test)) > 1 else 0.5
+    }
+    
+    # Display results
     print(f"\n{'='*60}")
     print("PERFORMANCE COMPARISON")
     print('='*60)
@@ -438,103 +543,94 @@ def evaluate_all_models(vqc_model, classical_models, X_test, y_test):
     
     print('='*60)
     
-    # Identify best model
-    best_model = max(results.keys(), key=lambda k: results[k]['f1_score'])
-    best_f1 = results[best_model]['f1_score']
-    print(f"\n🏆 Best Model: {best_model} (F1-Score: {best_f1:.4f})")
+    # Calculate improvement
+    vqc_f1 = results['VQC']['f1_score']
+    hybrid_f1 = results['Hybrid VQC+RF']['f1_score']
+    improvement = ((hybrid_f1 - vqc_f1) / vqc_f1) * 100 if vqc_f1 > 0 else 0
+    
+    print(f"\n🎯 Hybrid Model Performance:")
+    print(f"  F1-Score improvement: {improvement:+.2f}%")
+    print(f"  VQC alone: {vqc_f1:.4f}")
+    print(f"  Hybrid VQC+RF: {hybrid_f1:.4f}")
+    
+    if hybrid_f1 > vqc_f1:
+        print(f"  ✓ Hybrid model outperforms VQC alone!")
+    else:
+        print(f"  ⚠ VQC alone performs better (consider tuning hybrid model)")
     
     return results
 
 
-def save_all_models(vqc_model, classical_models):
-    """Save all trained models and scalers"""
+def save_model(model, filename):
+    """Save model to file"""
     print(f"\n{'='*60}")
-    print("SAVING MODELS")
+    print("STEP 5: SAVING MODELS")
     print('='*60)
     
     os.makedirs(CONFIG['model_dir'], exist_ok=True)
     
-    # Save VQC
-    vqc_path = os.path.join(CONFIG['model_dir'], 'vqc_model.pkl')
-    joblib.dump(vqc_model, vqc_path)
-    print(f"✓ VQC model saved: {vqc_path}")
+    filepath = os.path.join(CONFIG['model_dir'], filename)
+    joblib.dump(model, filepath)
+    print(f"✓ Model saved: {filepath}")
     
-    scaler_path = os.path.join(CONFIG['model_dir'], 'vqc_scaler.pkl')
-    joblib.dump(vqc_model.scaler, scaler_path)
-    print(f"✓ VQC scaler saved: {scaler_path}")
+    # Also save to current directory as specified
+    joblib.dump(model, filename)
+    print(f"✓ Model saved: {filename} (current directory)")
     
-    # Save classical models
-    for name, (model, scaler) in classical_models.items():
-        model_path = os.path.join(CONFIG['model_dir'], f'{name}_model.pkl')
-        joblib.dump(model, model_path)
-        print(f"✓ {name.replace('_', ' ').title()} saved: {model_path}")
-        
-        if scaler is not None:
-            scaler_path = os.path.join(CONFIG['model_dir'], f'{name}_scaler.pkl')
-            joblib.dump(scaler, scaler_path)
-            print(f"✓ {name.replace('_', ' ').title()} scaler saved: {scaler_path}")
-    
-    print(f"\n✓ All models saved in '{CONFIG['model_dir']}/' directory")
+    return filepath
 
 
-def plot_training_curve(vqc_model):
-    """Plot VQC training cost evolution"""
-    if not vqc_model.training_costs:
-        print("⚠ No training costs to plot")
-        return
-    
+def plot_results(vqc_model, results):
+    """Plot training curves and comparison"""
     os.makedirs(CONFIG['plots_dir'], exist_ok=True)
     
-    plt.figure(figsize=(12, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     
-    # Cost evolution
-    plt.subplot(1, 2, 1)
-    costs = vqc_model.training_costs
-    plt.plot(costs, 'b-', linewidth=2, alpha=0.8)
-    plt.title('VQC Training Cost Evolution', fontsize=14, fontweight='bold')
-    plt.xlabel('Iteration', fontsize=12)
-    plt.ylabel('Cost (Binary Cross-Entropy)', fontsize=12)
-    plt.grid(True, alpha=0.3)
+    # Training curve
+    if vqc_model.training_costs:
+        axes[0].plot(vqc_model.training_costs, 'b-', linewidth=2, alpha=0.8)
+        axes[0].set_title('VQC Training Cost Evolution', fontsize=14, fontweight='bold')
+        axes[0].set_xlabel('Iteration', fontsize=12)
+        axes[0].set_ylabel('Cost (Binary Cross-Entropy)', fontsize=12)
+        axes[0].grid(True, alpha=0.3)
     
-    final_cost = costs[-1]
-    plt.annotate(f'Final: {final_cost:.4f}', 
-                xy=(len(costs)-1, final_cost),
-                xytext=(10, 10), textcoords='offset points',
-                bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.7),
-                arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'))
+    # Model comparison
+    model_names = list(results.keys())
+    f1_scores = [results[name]['f1_score'] for name in model_names]
+    accuracies = [results[name]['accuracy'] for name in model_names]
     
-    # Cost improvement
-    plt.subplot(1, 2, 2)
-    if len(costs) > 1:
-        improvements = [-np.diff(costs)[i] for i in range(len(costs)-1)]
-        plt.plot(improvements, 'g-', linewidth=2, alpha=0.7)
-        plt.axhline(y=0, color='r', linestyle='--', alpha=0.5)
-        plt.title('Cost Improvement per Iteration', fontsize=14, fontweight='bold')
-        plt.xlabel('Iteration', fontsize=12)
-        plt.ylabel('Cost Reduction', fontsize=12)
-        plt.grid(True, alpha=0.3)
+    x = np.arange(len(model_names))
+    width = 0.35
+    
+    axes[1].bar(x - width/2, f1_scores, width, label='F1-Score', color='#667eea')
+    axes[1].bar(x + width/2, accuracies, width, label='Accuracy', color='#38ef7d')
+    axes[1].set_title('Model Performance Comparison', fontsize=14, fontweight='bold')
+    axes[1].set_ylabel('Score', fontsize=12)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(model_names, rotation=15, ha='right')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
-    
-    save_path = os.path.join(CONFIG['plots_dir'], 'training_progress.png')
+    save_path = os.path.join(CONFIG['plots_dir'], 'hybrid_model_results.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"\n✓ Training plot saved: {save_path}")
+    print(f"\n✓ Results plot saved: {save_path}")
     plt.close()
 
 
 def main():
-    """Main training pipeline"""
+    """Main training pipeline for hybrid quantum-classical model"""
     print("\n" + "="*60)
-    print("QUANTUM-ENHANCED SMART IRRIGATION SYSTEM")
+    print("HYBRID QUANTUM-CLASSICAL IRRIGATION MODEL")
     print("="*60)
-    print("Training Pipeline with Real Dataset")
+    print("VQC Quantum Feature Extraction + Random Forest Classifier")
     print("="*60)
     
     try:
-        # Step 1: Load dataset
+        # Load dataset
         X, y, feature_names = load_dataset(CONFIG['csv_file'])
         
-        # Step 2: Split data
+        # Split data
         print(f"\n{'='*60}")
         print("SPLITTING DATASET")
         print('='*60)
@@ -553,53 +649,81 @@ def main():
         print(f"Validation set: {len(X_val)} samples ({len(X_val)/len(X)*100:.1f}%)")
         print(f"Test set: {len(X_test)} samples ({len(X_test)/len(X)*100:.1f}%)")
         
-        # Step 3: Train VQC
-        vqc_model = QuantumIrrigationVQC(
-            n_qubits=CONFIG['n_qubits'],
-            n_layers=CONFIG['n_layers'],
-            n_features=CONFIG['n_features'],
-            learning_rate=CONFIG['learning_rate']
+        # Train VQC
+        vqc_model = train_vqc(X_train, y_train, X_val, y_val)
+        
+        # Extract quantum features
+        quantum_features_train = extract_quantum_features(vqc_model, X_train, "training")
+        quantum_features_val = extract_quantum_features(vqc_model, X_val, "validation")
+        quantum_features_test = extract_quantum_features(vqc_model, X_test, "test")
+        
+        # Train hybrid Random Forest
+        rf_model, feature_scaler = train_hybrid_rf(X_train, y_train, quantum_features_train)
+        
+        # Evaluate models
+        results = evaluate_models(
+            vqc_model, rf_model, feature_scaler,
+            X_test, y_test, quantum_features_test
         )
         
-        vqc_model.fit(X_train, y_train, X_val, y_val, verbose=True)
+        # Create hybrid model wrapper
+        hybrid_model = HybridQuantumClassicalModel(vqc_model, rf_model, feature_scaler)
         
-        # Step 4: Train classical models
-        classical_models = train_classical_models(X_train, y_train)
+        # Save models
+        save_model(hybrid_model, CONFIG['hybrid_model_file'])
+        save_model(vqc_model, 'vqc_model.pkl')
+        save_model(rf_model, 'rf_model.pkl')
         
-        # Step 5: Evaluate all models
-        results = evaluate_all_models(vqc_model, classical_models, X_test, y_test)
+        # Plot results
+        plot_results(vqc_model, results)
         
-        # Step 6: Plot training curve
-        plot_training_curve(vqc_model)
-        
-        # Step 7: Save all models
-        save_all_models(vqc_model, classical_models)
-        
-        # Step 8: Final summary
+        # Final summary
         print(f"\n{'='*60}")
         print("TRAINING SUMMARY")
         print('='*60)
         
+        print(f"\nHybrid Model Architecture:")
+        print(f"  1. VQC: {CONFIG['n_qubits']} qubits, {CONFIG['n_layers']} layers")
+        print(f"  2. Quantum feature extraction: {CONFIG['n_qubits']} expectation values")
+        print(f"  3. Classical features: {X_train.shape[1]}")
+        print(f"  4. Hybrid features: {X_train.shape[1] + CONFIG['n_qubits']}")
+        print(f"  5. Random Forest: {CONFIG['rf_n_estimators']} estimators, max_depth={CONFIG['rf_max_depth']}")
+        
+        print(f"\nVQC Training Statistics:")
         if vqc_model.training_costs:
             initial_cost = vqc_model.training_costs[0]
             final_cost = vqc_model.training_costs[-1]
             improvement = initial_cost - final_cost
             improvement_percent = (improvement / initial_cost) * 100 if initial_cost > 0 else 0
             
-            print(f"\nVQC Training Statistics:")
             print(f"  Initial cost: {initial_cost:.6f}")
             print(f"  Final cost: {final_cost:.6f}")
             print(f"  Improvement: {improvement:.6f} ({improvement_percent:.2f}%)")
             print(f"  Training time: {vqc_model.training_time:.2f} seconds")
             print(f"  Total iterations: {len(vqc_model.training_costs)}")
         
-        print(f"\n{'='*60}")
-        print("✓ TRAINING PIPELINE COMPLETED SUCCESSFULLY!")
-        print('='*60)
-        print(f"All models saved in: {CONFIG['model_dir']}/")
-        print(f"Plots saved in: {CONFIG['plots_dir']}/")
+        print(f"\nModel Performance:")
+        for model_name, metrics in results.items():
+            print(f"  {model_name}:")
+            print(f"    Accuracy: {metrics['accuracy']:.4f}")
+            print(f"    F1-Score: {metrics['f1_score']:.4f}")
+            print(f"    AUC: {metrics['auc']:.4f}")
         
-        return vqc_model, classical_models, results
+        print(f"\n{'='*60}")
+        print("✓ HYBRID MODEL TRAINING COMPLETED SUCCESSFULLY!")
+        print('='*60)
+        print(f"\nSaved files:")
+        print(f"  • {CONFIG['hybrid_model_file']} - Complete hybrid model")
+        print(f"  • models/vqc_model.pkl - VQC quantum model")
+        print(f"  • models/rf_model.pkl - Random Forest model")
+        print(f"  • plots/hybrid_model_results.png - Performance visualization")
+        
+        print(f"\nUsage example:")
+        print(f"  import joblib")
+        print(f"  hybrid_model = joblib.load('{CONFIG['hybrid_model_file']}')")
+        print(f"  predictions = hybrid_model.predict(new_data)")
+        
+        return vqc_model, rf_model, hybrid_model, results
         
     except FileNotFoundError as e:
         print(f"\n{'='*60}")
@@ -609,11 +733,7 @@ def main():
         print(f"\nRequired columns:")
         print(f"  Features: {CONFIG['feature_columns']}")
         print(f"  Label: {CONFIG['label_column']}")
-        print(f"\nPlease check:")
-        print("  1. File exists in the current directory")
-        print("  2. File name is correct")
-        print("  3. CSV has the required columns")
-        return None, None, None
+        return None, None, None, None
         
     except Exception as e:
         print(f"\n{'='*60}")
@@ -622,11 +742,55 @@ def main():
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
-        return None, None, None
+        return None, None, None, None
+
+
+def test_hybrid_model():
+    """Test the saved hybrid model with sample predictions"""
+    print(f"\n{'='*60}")
+    print("TESTING SAVED HYBRID MODEL")
+    print('='*60)
+    
+    try:
+        # Load the hybrid model
+        hybrid_model = joblib.load(CONFIG['hybrid_model_file'])
+        print(f"✓ Hybrid model loaded successfully")
+        
+        # Create sample test data
+        sample_data = np.array([
+            [400.0, 35.0, 45.0],  # Dry conditions
+            [850.0, 22.0, 75.0],  # Wet conditions
+            [600.0, 28.0, 60.0],  # Moderate conditions
+        ])
+        
+        print(f"\nTesting with sample data:")
+        print(f"  Sample 1: Soil={sample_data[0,0]:.1f}, Temp={sample_data[0,1]:.1f}°C, Humidity={sample_data[0,2]:.1f}%")
+        print(f"  Sample 2: Soil={sample_data[1,0]:.1f}, Temp={sample_data[1,1]:.1f}°C, Humidity={sample_data[1,2]:.1f}%")
+        print(f"  Sample 3: Soil={sample_data[2,0]:.1f}, Temp={sample_data[2,1]:.1f}°C, Humidity={sample_data[2,2]:.1f}%")
+        
+        # Make predictions
+        predictions = hybrid_model.predict(sample_data)
+        probabilities = hybrid_model.predict_proba(sample_data)
+        
+        print(f"\nPredictions:")
+        for i, (pred, prob) in enumerate(zip(predictions, probabilities)):
+            status = "PUMP ON" if pred == 1 else "PUMP OFF"
+            confidence = prob[1] if pred == 1 else prob[0]
+            print(f"  Sample {i+1}: {status} (Confidence: {confidence*100:.1f}%)")
+        
+        print(f"\n✓ Hybrid model is working correctly!")
+        
+    except FileNotFoundError:
+        print(f"❌ Hybrid model file not found: {CONFIG['hybrid_model_file']}")
+        print(f"   Please run training first to generate the model.")
+    except Exception as e:
+        print(f"❌ Error testing hybrid model: {e}")
 
 
 if __name__ == "__main__":
-    print("\nStarting training pipeline...")
+    print("\n" + "="*60)
+    print("STARTING HYBRID QUANTUM-CLASSICAL TRAINING PIPELINE")
+    print("="*60)
     print("Checking dependencies...")
     
     try:
@@ -648,17 +812,42 @@ if __name__ == "__main__":
     print("\nAll dependencies satisfied. Starting training...\n")
     
     # Run main training
-    vqc_model, classical_models, results = main()
+    vqc_model, rf_model, hybrid_model, results = main()
     
-    if vqc_model is not None:
+    if hybrid_model is not None:
         print("\n" + "="*60)
         print("🎉 SUCCESS!")
         print("="*60)
-        print("The quantum and classical models are trained and ready.")
-        print("\nNext steps:")
-        print("  1. Check the 'models/' folder for saved models")
-        print("  2. Check the 'plots/' folder for training visualizations")
-        print("  3. Use the models for irrigation predictions")
+        print("The hybrid quantum-classical model is trained and ready.")
+        print("\n📊 Model Comparison:")
+        if results:
+            for model_name, metrics in results.items():
+                print(f"  {model_name}: F1={metrics['f1_score']:.4f}, Acc={metrics['accuracy']:.4f}")
+        
+        print("\n🧪 Testing the saved model...")
+        test_hybrid_model()
+        
+        print("\n" + "="*60)
+        print("🚀 NEXT STEPS")
+        print("="*60)
+        print("1. Check 'models/' folder for saved models")
+        print("2. Check 'plots/' folder for visualizations")
+        print("3. Use hybrid_irrigation_model.pkl for predictions")
+        print("4. Run the Streamlit app to test predictions interactively")
+        print("\nExample usage:")
+        print("  import joblib")
+        print("  import numpy as np")
+        print("  ")
+        print("  # Load model")
+        print("  model = joblib.load('hybrid_irrigation_model.pkl')")
+        print("  ")
+        print("  # Make prediction")
+        print("  data = np.array([[600.0, 28.0, 60.0]])  # [soil, temp, humidity]")
+        print("  prediction = model.predict(data)")
+        print("  probability = model.predict_proba(data)")
+        print("  ")
+        print("  print(f'Prediction: {prediction[0]}')")
+        print("  print(f'Confidence: {probability[0][prediction[0]]*100:.1f}%')")
         print("="*60)
     else:
         print("\n" + "="*60)

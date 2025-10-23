@@ -1,25 +1,34 @@
+"""
+Hybrid Quantum-Classical Irrigation Prediction Web App
+=======================================================
+A Streamlit application for predicting irrigation requirements using
+a hybrid VQC (Variational Quantum Classifier) + Random Forest model.
+
+Usage:
+    streamlit run app.py
+
+Author: Smart Irrigation System
+"""
+
 import streamlit as st
 import numpy as np
-import pandas as pd
 import joblib
 import plotly.graph_objects as go
-import plotly.express as px
-import os
+from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
 
-# Import PennyLane for VQC model
+# Import required classes for model unpickling
 try:
     import pennylane as qml
     from pennylane import numpy as pnp
-    from sklearn.preprocessing import MinMaxScaler
+    from sklearn.preprocessing import MinMaxScaler, StandardScaler
     PENNYLANE_AVAILABLE = True
 except ImportError:
     PENNYLANE_AVAILABLE = False
-    st.warning("⚠️ PennyLane not installed. VQC model will not be available.")
+    st.warning("⚠️ PennyLane not installed. Some features may be limited.")
 
-
-# VQC Class Definition (must match the training.py version)
+# ==================== MODEL CLASSES (Required for unpickling) ====================
 class QuantumIrrigationVQC:
     """Variational Quantum Classifier for Irrigation Prediction"""
     
@@ -29,22 +38,23 @@ class QuantumIrrigationVQC:
         self.n_features = n_features
         self.learning_rate = learning_rate
         
-        # Initialize quantum device
-        self.dev = qml.device("default.qubit", wires=n_qubits)
-        
-        # Initialize components
-        self.weights = None
-        self.scaler = MinMaxScaler(feature_range=(0, np.pi))
-        self.training_costs = []
-        self.is_trained = False
-        self.training_time = 0
-        
-        # Create quantum circuit
-        self.quantum_circuit = qml.QNode(
-            self._circuit, 
-            self.dev, 
-            diff_method="parameter-shift"
-        )
+        if PENNYLANE_AVAILABLE:
+            # Initialize quantum device
+            self.dev = qml.device("default.qubit", wires=n_qubits)
+            
+            # Initialize components
+            self.weights = None
+            self.scaler = MinMaxScaler(feature_range=(0, np.pi))
+            self.training_costs = []
+            self.is_trained = False
+            self.training_time = 0
+            
+            # Create quantum circuit
+            self.quantum_circuit = qml.QNode(
+                self._circuit, 
+                self.dev, 
+                diff_method="parameter-shift"
+            )
     
     def _feature_encoding(self, x):
         """Angle encoding for features"""
@@ -72,10 +82,32 @@ class QuantumIrrigationVQC:
         self._variational_ansatz(weights)
         return qml.expval(qml.PauliZ(0))
     
-    def _prediction_from_expectation(self, expectation_val):
-        """Convert expectation value [-1, 1] to probability [0, 1]"""
-        probability = (expectation_val + 1) / 2
-        return np.clip(probability, 0.001, 0.999)
+    def _circuit_all_qubits(self, x, weights):
+        """Circuit that returns expectation values from all qubits"""
+        self._feature_encoding(x)
+        self._variational_ansatz(weights)
+        return [qml.expval(qml.PauliZ(i)) for i in range(self.n_qubits)]
+    
+    def extract_quantum_features(self, X):
+        """Extract quantum features (expectation values from all qubits)"""
+        if not self.is_trained:
+            raise ValueError("VQC must be trained before extracting features")
+        
+        X_scaled = self.scaler.transform(X)
+        quantum_features = []
+        
+        # Create circuit that measures all qubits
+        circuit_all = qml.QNode(self._circuit_all_qubits, self.dev)
+        
+        for x_sample in X_scaled:
+            try:
+                expectations = circuit_all(x_sample, self.weights)
+                quantum_features.append(expectations)
+            except Exception as e:
+                print(f"Feature extraction error: {e}")
+                quantum_features.append([0.0] * self.n_qubits)
+        
+        return np.array(quantum_features)
     
     def predict_proba(self, X):
         """Predict class probabilities"""
@@ -88,9 +120,11 @@ class QuantumIrrigationVQC:
         for x_sample in X_scaled:
             try:
                 expectation = self.quantum_circuit(x_sample, self.weights)
-                prob = self._prediction_from_expectation(expectation)
+                prob = (expectation + 1) / 2  # Convert to probability
+                prob = np.clip(prob, 0.001, 0.999)
                 probabilities.append(float(prob))
             except Exception as e:
+                print(f"Prediction error: {e}")
                 probabilities.append(0.5)
         
         return np.array(probabilities)
@@ -100,272 +134,115 @@ class QuantumIrrigationVQC:
         probabilities = self.predict_proba(X)
         return (probabilities > 0.5).astype(int)
 
-# Page configuration
-st.set_page_config(
-    page_title="Smart Irrigation System",
-    page_icon="🌾",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
-# Custom CSS for better styling
-st.markdown("""
-    <style>
-    .main {
-        background-color: #f0f2f6;
-    }
-    .stButton>button {
-        width: 100%;
-        background-color: #4CAF50;
-        color: white;
-        height: 3em;
-        border-radius: 10px;
-        font-size: 18px;
-        font-weight: bold;
-        border: none;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        transition: all 0.3s;
-    }
-    .stButton>button:hover {
-        background-color: #45a049;
-        box-shadow: 0 6px 8px rgba(0,0,0,0.15);
-        transform: translateY(-2px);
-    }
-    .prediction-card {
-        background-color: white;
-        padding: 20px;
-        border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        margin: 10px 0;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 20px;
-        border-radius: 10px;
-        text-align: center;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-    }
-    .highlight-best {
-        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-        color: white;
-        padding: 15px;
-        border-radius: 10px;
-        font-weight: bold;
-        text-align: center;
-        box-shadow: 0 6px 12px rgba(0,0,0,0.2);
-        animation: pulse 2s infinite;
-    }
-    @keyframes pulse {
-        0%, 100% { transform: scale(1); }
-        50% { transform: scale(1.02); }
-    }
-    .info-box {
-        background-color: #e3f2fd;
-        padding: 15px;
-        border-radius: 8px;
-        border-left: 5px solid #2196F3;
-        margin: 10px 0;
-    }
-    h1 {
-        color: #2c3e50;
-        text-align: center;
-        padding: 20px 0;
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 8px;
-    }
-    .stTabs [data-baseweb="tab"] {
-        background-color: white;
-        border-radius: 8px 8px 0 0;
-        padding: 10px 20px;
-        font-weight: 600;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-
-@st.cache_resource
-def load_models():
-    """Load all trained models and scalers"""
-    models = {}
+class HybridQuantumClassicalModel:
+    """Hybrid model combining VQC quantum features with Random Forest"""
     
-    # Get the directory where app.py is located
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    model_dir = os.path.join(current_dir, 'models')
+    def __init__(self, vqc_model, rf_model, feature_scaler=None):
+        self.vqc_model = vqc_model
+        self.rf_model = rf_model
+        self.feature_scaler = feature_scaler
+        
+    def predict(self, X):
+        """Make predictions using hybrid features"""
+        # Extract quantum features
+        quantum_features = self.vqc_model.extract_quantum_features(X)
+        
+        # Combine with classical features
+        hybrid_features = np.concatenate([X, quantum_features], axis=1)
+        
+        # Scale if scaler exists
+        if self.feature_scaler is not None:
+            hybrid_features = self.feature_scaler.transform(hybrid_features)
+        
+        return self.rf_model.predict(hybrid_features)
+    
+    def predict_proba(self, X):
+        """Predict probabilities using hybrid features"""
+        quantum_features = self.vqc_model.extract_quantum_features(X)
+        hybrid_features = np.concatenate([X, quantum_features], axis=1)
+        
+        if self.feature_scaler is not None:
+            hybrid_features = self.feature_scaler.transform(hybrid_features)
+        
+        return self.rf_model.predict_proba(hybrid_features)
+
+
+# ==================== CONFIGURATION ====================
+CONFIG = {
+    'model_path': 'models/hybrid_irrigation_model.pkl',
+    'feature_names': ['Soil Moisture', 'Temperature', 'Air Humidity'],
+    'feature_ranges': {
+        'Soil Moisture': (0, 1000),
+        'Temperature': (-10, 50),
+        'Air Humidity': (0, 100)
+    },
+    'feature_defaults': {
+        'Soil Moisture': 600.0,
+        'Temperature': 25.0,
+        'Air Humidity': 60.0
+    },
+    'feature_units': {
+        'Soil Moisture': 'units',
+        'Temperature': '°C',
+        'Air Humidity': '%'
+    },
+    'app_title': '🌱 Smart Irrigation Predictor',
+    'app_description': 'Hybrid Quantum-Classical AI Model for Irrigation Decision Making'
+}
+
+
+# ==================== UTILITY FUNCTIONS ====================
+@st.cache_resource
+def load_model():
+    """Load the trained hybrid model with caching"""
+    model_path = Path(CONFIG['model_path'])
+    
+    if not model_path.exists():
+        return None, f"Model file '{CONFIG['model_path']}' not found"
+    
+    if not PENNYLANE_AVAILABLE:
+        return None, "PennyLane is required but not installed. Run: pip install pennylane"
     
     try:
-        # Check if models directory exists
-        if not os.path.exists(model_dir):
-            st.error(f"Models directory not found: {model_dir}")
-            st.info("Please create a 'models' folder in the same directory as app.py")
-            return {}
-        
-        # Load VQC
-        vqc_model_path = os.path.join(model_dir, 'vqc_model.pkl')
-        vqc_scaler_path = os.path.join(model_dir, 'vqc_scaler.pkl')
-        if os.path.exists(vqc_model_path) and PENNYLANE_AVAILABLE:
-            models['VQC'] = {
-                'model': joblib.load(vqc_model_path),
-                'scaler': joblib.load(vqc_scaler_path) if os.path.exists(vqc_scaler_path) else None,
-                'type': 'quantum'
-            }
-        elif os.path.exists(vqc_model_path) and not PENNYLANE_AVAILABLE:
-            st.warning("VQC model found but PennyLane is not installed. Skipping VQC.")
-        
-        # Load Logistic Regression
-        lr_model_path = os.path.join(model_dir, 'logistic_regression_model.pkl')
-        lr_scaler_path = os.path.join(model_dir, 'logistic_regression_scaler.pkl')
-        if os.path.exists(lr_model_path):
-            models['Logistic Regression'] = {
-                'model': joblib.load(lr_model_path),
-                'scaler': joblib.load(lr_scaler_path) if os.path.exists(lr_scaler_path) else None,
-                'type': 'classical'
-            }
-        
-        # Load SVM
-        svm_model_path = os.path.join(model_dir, 'svm_model.pkl')
-        svm_scaler_path = os.path.join(model_dir, 'svm_scaler.pkl')
-        if os.path.exists(svm_model_path):
-            models['SVM'] = {
-                'model': joblib.load(svm_model_path),
-                'scaler': joblib.load(svm_scaler_path) if os.path.exists(svm_scaler_path) else None,
-                'type': 'classical'
-            }
-        
-        # Load Random Forest
-        rf_model_path = os.path.join(model_dir, 'random_forest_model.pkl')
-        if os.path.exists(rf_model_path):
-            models['Random Forest'] = {
-                'model': joblib.load(rf_model_path),
-                'scaler': None,
-                'type': 'classical'
-            }
-        
-        return models
-    
+        model = joblib.load(model_path)
+        return model, None
     except Exception as e:
-        st.error(f"Error loading models: {e}")
-        import traceback
-        st.error(traceback.format_exc())
-        return {}
+        return None, f"Error loading model: {str(e)}"
 
 
-def make_predictions(models, soil_moisture, temperature, humidity):
-    """Make predictions using all loaded models"""
-    X_input = np.array([[soil_moisture, temperature, humidity]])
-    predictions = {}
+def create_confidence_gauge(confidence, prediction):
+    """Create a Plotly gauge chart for confidence visualization"""
     
-    for model_name, model_info in models.items():
-        try:
-            model = model_info['model']
-            scaler = model_info['scaler']
-            
-            # Scale input if scaler exists
-            if scaler is not None:
-                X_scaled = scaler.transform(X_input)
-            else:
-                X_scaled = X_input
-            
-            # Get prediction and probability
-            if model_name == 'VQC':
-                # VQC has custom predict_proba method
-                prob = model.predict_proba(X_input)[0]
-                pred = 1 if prob > 0.5 else 0
-            else:
-                pred = model.predict(X_scaled)[0]
-                if hasattr(model, 'predict_proba'):
-                    prob_array = model.predict_proba(X_scaled)[0]
-                    prob = prob_array[1]  # Probability of class 1
-                else:
-                    prob = float(pred)
-            
-            predictions[model_name] = {
-                'prediction': int(pred),
-                'confidence': float(prob) if pred == 1 else float(1 - prob),
-                'probability': float(prob),
-                'type': model_info['type']
-            }
-        
-        except Exception as e:
-            st.warning(f"Error with {model_name}: {e}")
-            predictions[model_name] = {
-                'prediction': 0,
-                'confidence': 0.5,
-                'probability': 0.5,
-                'type': model_info['type'],
-                'error': str(e)
-            }
+    # Determine color based on confidence level
+    if confidence >= 80:
+        color = "#10b981"  # Green
+    elif confidence >= 60:
+        color = "#f59e0b"  # Orange
+    else:
+        color = "#ef4444"  # Red
     
-    return predictions
-
-
-def plot_confidence_comparison(predictions):
-    """Create interactive bar chart comparing model confidences"""
-    model_names = list(predictions.keys())
-    confidences = [pred['confidence'] * 100 for pred in predictions.values()]
-    colors = ['#FF6B6B' if pred['type'] == 'quantum' else '#4ECDC4' 
-              for pred in predictions.values()]
-    
-    fig = go.Figure(data=[
-        go.Bar(
-            x=model_names,
-            y=confidences,
-            marker_color=colors,
-            text=[f"{conf:.1f}%" for conf in confidences],
-            textposition='auto',
-            hovertemplate='<b>%{x}</b><br>Confidence: %{y:.1f}%<extra></extra>'
-        )
-    ])
-    
-    fig.update_layout(
-        title={
-            'text': '📊 Model Confidence Comparison',
-            'x': 0.5,
-            'xanchor': 'center',
-            'font': {'size': 20, 'color': '#2c3e50', 'family': 'Arial Black'}
-        },
-        xaxis_title='Model',
-        yaxis_title='Confidence (%)',
-        yaxis_range=[0, 105],
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        height=400,
-        showlegend=False,
-        font=dict(size=12),
-        hovermode='x'
-    )
-    
-    fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(showgrid=True, gridcolor='lightgray', gridwidth=0.5)
-    
-    return fig
-
-
-def plot_prediction_gauge(prediction, confidence):
-    """Create gauge chart for prediction visualization"""
     fig = go.Figure(go.Indicator(
-        mode="gauge+number+delta",
-        value=confidence * 100,
+        mode="gauge+number",
+        value=confidence,
         domain={'x': [0, 1], 'y': [0, 1]},
-        title={'text': "Pump Status" if prediction == 1 else "No Irrigation", 
-               'font': {'size': 24, 'color': '#2c3e50'}},
-        delta={'reference': 50, 'increasing': {'color': "green"}},
+        title={'text': "Prediction Confidence", 'font': {'size': 20, 'color': '#1f2937'}},
+        number={'suffix': "%", 'font': {'size': 40, 'color': '#1f2937'}},
         gauge={
-            'axis': {'range': [None, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
-            'bar': {'color': "#4CAF50" if prediction == 1 else "#FF5722"},
+            'axis': {'range': [0, 100], 'tickwidth': 2, 'tickcolor': "#6b7280"},
+            'bar': {'color': color, 'thickness': 0.75},
             'bgcolor': "white",
             'borderwidth': 2,
-            'bordercolor': "gray",
+            'bordercolor': "#e5e7eb",
             'steps': [
-                {'range': [0, 50], 'color': '#ffebee'},
-                {'range': [50, 75], 'color': '#fff3e0'},
-                {'range': [75, 100], 'color': '#e8f5e9'}
+                {'range': [0, 50], 'color': '#fee2e2'},
+                {'range': [50, 70], 'color': '#fef3c7'},
+                {'range': [70, 100], 'color': '#d1fae5'}
             ],
             'threshold': {
-                'line': {'color': "red", 'width': 4},
+                'line': {'color': "#1f2937", 'width': 4},
                 'thickness': 0.75,
-                'value': 90
+                'value': 75
             }
         }
     ))
@@ -373,367 +250,420 @@ def plot_prediction_gauge(prediction, confidence):
     fig.update_layout(
         height=300,
         margin=dict(l=20, r=20, t=60, b=20),
-        paper_bgcolor='rgba(0,0,0,0)',
-        font={'color': "#2c3e50", 'family': "Arial"}
+        paper_bgcolor="rgba(0,0,0,0)",
+        font={'family': "Arial, sans-serif"}
     )
     
     return fig
 
 
+def create_feature_importance_chart(features, values):
+    """Create a bar chart showing input feature values"""
+    
+    # Normalize values to 0-100 scale for visualization
+    normalized_values = []
+    for feature, value in zip(features, values):
+        min_val, max_val = CONFIG['feature_ranges'][feature]
+        normalized = ((value - min_val) / (max_val - min_val)) * 100
+        normalized_values.append(normalized)
+    
+    colors = ['#3b82f6', '#10b981', '#f59e0b']
+    
+    fig = go.Figure(data=[
+        go.Bar(
+            x=features,
+            y=normalized_values,
+            text=[f"{v:.1f}" for v in values],
+            textposition='auto',
+            marker_color=colors,
+            hovertemplate='<b>%{x}</b><br>Value: %{text}<extra></extra>'
+        )
+    ])
+    
+    fig.update_layout(
+        title="Input Feature Values (Normalized Scale)",
+        xaxis_title="Features",
+        yaxis_title="Normalized Value (0-100)",
+        height=300,
+        margin=dict(l=20, r=20, t=40, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font={'family': "Arial, sans-serif", 'color': '#1f2937'},
+        showlegend=False
+    )
+    
+    fig.update_yaxes(range=[0, 100], gridcolor='#e5e7eb')
+    fig.update_xaxes(gridcolor='#e5e7eb')
+
+    
+    return fig
+
+
+def get_recommendation(prediction, confidence, soil_moisture, temperature, humidity):
+    """Generate irrigation recommendation based on prediction and conditions"""
+    
+    if prediction == 1:  # Pump ON
+        base_msg = "💧 **Irrigation Recommended**"
+        
+        reasons = []
+        if soil_moisture < 500:
+            reasons.append("Low soil moisture detected")
+        if temperature > 30:
+            reasons.append("High temperature increases evaporation")
+        if humidity < 50:
+            reasons.append("Low humidity increases water demand")
+        
+        if reasons:
+            reason_text = "\n- " + "\n- ".join(reasons)
+        else:
+            reason_text = "\n- Optimal irrigation conditions detected"
+        
+        if confidence >= 80:
+            confidence_msg = "✅ High confidence prediction"
+        elif confidence >= 60:
+            confidence_msg = "⚠️ Moderate confidence - monitor conditions"
+        else:
+            confidence_msg = "⚠️ Low confidence - verify with manual inspection"
+        
+        return f"{base_msg}\n\n**Reasons:**{reason_text}\n\n{confidence_msg}"
+    
+    else:  # Pump OFF
+        base_msg = "🌤️ **No Irrigation Required**"
+        
+        reasons = []
+        if soil_moisture > 700:
+            reasons.append("Adequate soil moisture levels")
+        if temperature < 25:
+            reasons.append("Moderate temperature conditions")
+        if humidity > 60:
+            reasons.append("High humidity reduces water loss")
+        
+        if reasons:
+            reason_text = "\n- " + "\n- ".join(reasons)
+        else:
+            reason_text = "\n- Current conditions do not require irrigation"
+        
+        if confidence >= 80:
+            confidence_msg = "✅ High confidence prediction"
+        elif confidence >= 60:
+            confidence_msg = "⚠️ Moderate confidence - continue monitoring"
+        else:
+            confidence_msg = "⚠️ Low confidence - verify with manual inspection"
+        
+        return f"{base_msg}\n\n**Reasons:**{reason_text}\n\n{confidence_msg}"
+
+
+# ==================== MAIN APP ====================
 def main():
-    # Header
+    """Main application function"""
+    
+    # Page configuration
+    st.set_page_config(
+        page_title=CONFIG['app_title'],
+        page_icon="🌱",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Custom CSS for better styling
     st.markdown("""
-        <h1>🌾 Quantum-Enhanced Smart Irrigation System</h1>
-        <p style='text-align: center; color: #7f8c8d; font-size: 18px;'>
-            AI-Powered Precision Agriculture | Quantum + Classical ML
-        </p>
+        <style>
+        .main {
+            padding: 0rem 1rem;
+        }
+        .stButton>button {
+            width: 100%;
+            background-color: #10b981;
+            color: white;
+            font-size: 18px;
+            font-weight: bold;
+            padding: 0.75rem 2rem;
+            border-radius: 10px;
+            border: none;
+            transition: all 0.3s;
+        }
+        .stButton>button:hover {
+            background-color: #059669;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .prediction-box {
+            padding: 2rem;
+            border-radius: 10px;
+            margin: 1rem 0;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .pump-on {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .pump-off {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+        }
+        h1 {
+            color: #1f2937;
+            font-weight: 800;
+        }
+        h2, h3 {
+            color: #374151;
+        }
+        .stAlert {
+            border-radius: 10px;
+        }
+        </style>
     """, unsafe_allow_html=True)
     
+    # Header
+    st.title(CONFIG['app_title'])
+    st.markdown(f"**{CONFIG['app_description']}**")
     st.markdown("---")
     
-    # Load models
-    with st.spinner("🔄 Loading AI models..."):
-        models = load_models()
+    # Load model
+    model, error = load_model()
     
-    if not models:
-        st.error("❌ **No models found!** Please ensure model files are in the 'models/' directory.")
+    if error:
+        st.error(f"❌ **{error}**")
+        st.warning("""
+        **Model not found!** Please ensure you have:
+        1. Trained the hybrid model by running `training.py`
+        2. The file `hybrid_irrigation_model.pkl` exists in the same directory as this app
+        3. All required dependencies are installed
+        """)
         st.info("""
-        **Required files:**
-        - `vqc_model.pkl` and `vqc_scaler.pkl`
-        - `logistic_regression_model.pkl` and `logistic_regression_scaler.pkl`
-        - `svm_model.pkl` and `svm_scaler.pkl`
-        - `random_forest_model.pkl`
+        **Install dependencies:**
+        ```bash
+        pip install streamlit numpy pandas scikit-learn pennylane joblib plotly
+        ```
+        
+        **Training the model:**
+        ```bash
+        python training.py
+        ```
+        
+        **Running this app:**
+        ```bash
+        streamlit run app.py
+        ```
         """)
         return
     
-    st.success(f"✅ Successfully loaded **{len(models)}** models")
+    st.success("✅ Hybrid Quantum-Classical Model Loaded Successfully!")
     
-    # Sidebar for inputs
+    # Sidebar - Model Information
     with st.sidebar:
-        st.header("🎛️ Input Parameters")
-        st.markdown("Adjust the sliders to set environmental conditions:")
-        
-        # Check if example scenario was clicked
-        if 'example' in st.session_state:
-            default_soil = st.session_state.example['soil']
-            default_temp = st.session_state.example['temp']
-            default_hum = st.session_state.example['hum']
-            del st.session_state.example
-        else:
-            default_soil = 600.0
-            default_temp = 28.0
-            default_hum = 60.0
-        
-        st.markdown("### 💧 Soil Moisture")
-        soil_moisture = st.slider(
-            "Soil Moisture",
-            min_value=350.0,
-            max_value=970.0,
-            value=default_soil,
-            step=1.0,
-            help="Soil moisture reading (350-970 range from dataset)"
-        )
-        
-        st.markdown("### 🌡️ Temperature")
-        temperature = st.slider(
-            "Temperature (°C)",
-            min_value=18.0,
-            max_value=39.0,
-            value=default_temp,
-            step=0.1,
-            help="Ambient air temperature in Celsius"
-        )
-        
-        st.markdown("### 💨 Air Humidity")
-        humidity = st.slider(
-            "Air Humidity (%)",
-            min_value=38.0,
-            max_value=82.0,
-            value=default_hum,
-            step=0.5,
-            help="Relative humidity percentage in the air"
-        )
-        
-        st.markdown("---")
-        predict_button = st.button("🚀 PREDICT PUMP STATUS", use_container_width=True)
-        
-        st.markdown("---")
+        st.header("📊 Model Information")
         st.markdown("""
-        <div class='info-box'>
-        <b>ℹ️ About</b><br>
-        This system uses quantum and classical machine learning to predict whether the irrigation pump should be ON or OFF based on environmental conditions.
-        <br><br>
-        <b>Dataset Ranges:</b><br>
-        • Soil Moisture: 350-970<br>
-        • Temperature: 18-39°C<br>
-        • Humidity: 38-82%
-        </div>
-        """, unsafe_allow_html=True)
+        **Architecture:**
+        - 🔬 VQC Quantum Feature Extraction
+        - 🌲 Random Forest Classifier
+        - 🤝 Hybrid Quantum-Classical Approach
         
-        # Add example scenarios
+        **Features:**
+        - Soil Moisture (0-1000 units)
+        - Temperature (-10 to 50°C)
+        - Air Humidity (0-100%)
+        """)
+        
         st.markdown("---")
-        st.markdown("### 📋 Example Scenarios")
+        st.header("ℹ️ About")
+        st.markdown("""
+        This application uses a hybrid quantum-classical machine learning model 
+        to predict irrigation requirements based on environmental conditions.
         
-        if st.button("🌵 Dry Conditions", use_container_width=True):
-            st.session_state.example = {'soil': 400.0, 'temp': 35.0, 'hum': 45.0}
-            st.rerun()
+        The model combines:
+        - **VQC**: Variational Quantum Classifier for quantum feature extraction
+        - **Random Forest**: Classical ML for final classification
+        """)
         
-        if st.button("🌧️ Wet Conditions", use_container_width=True):
-            st.session_state.example = {'soil': 850.0, 'temp': 22.0, 'hum': 75.0}
-            st.rerun()
-        
-        if st.button("☀️ Hot & Moderate", use_container_width=True):
-            st.session_state.example = {'soil': 600.0, 'temp': 36.0, 'hum': 55.0}
-            st.rerun()
+        st.markdown("---")
+        st.markdown("**Developed by:** Smart Irrigation Team")
+        st.markdown("**Model Version:** 1.0")
     
     # Main content area
-    col1, col2, col3 = st.columns([1, 1, 1])
+    col1, col2 = st.columns([1, 1])
     
     with col1:
-        st.markdown(f"""
-        <div class='metric-card'>
-            <h3>💧 Soil Moisture</h3>
-            <h1>{soil_moisture:.1f}</h1>
-        </div>
-        """, unsafe_allow_html=True)
+        st.header("🎛️ Input Parameters")
+        
+        # Input fields with descriptions
+        st.markdown("### Soil Moisture")
+        soil_moisture = st.slider(
+            "Soil moisture level (lower = drier soil)",
+            min_value=float(CONFIG['feature_ranges']['Soil Moisture'][0]),
+            max_value=float(CONFIG['feature_ranges']['Soil Moisture'][1]),
+            value=CONFIG['feature_defaults']['Soil Moisture'],
+            step=10.0,
+            help="Soil moisture sensor reading. Lower values indicate drier soil requiring irrigation."
+        )
+        
+        st.markdown("### Temperature")
+        temperature = st.slider(
+            "Air temperature in degrees Celsius",
+            min_value=float(CONFIG['feature_ranges']['Temperature'][0]),
+            max_value=float(CONFIG['feature_ranges']['Temperature'][1]),
+            value=CONFIG['feature_defaults']['Temperature'],
+            step=0.5,
+            help="Current air temperature. Higher temperatures increase water evaporation."
+        )
+        
+        st.markdown("### Air Humidity")
+        humidity = st.slider(
+            "Relative air humidity percentage",
+            min_value=float(CONFIG['feature_ranges']['Air Humidity'][0]),
+            max_value=float(CONFIG['feature_ranges']['Air Humidity'][1]),
+            value=CONFIG['feature_defaults']['Air Humidity'],
+            step=1.0,
+            help="Relative humidity in the air. Lower humidity increases plant water demand."
+        )
+        
+        st.markdown("---")
+        
+        # Predict button
+        predict_button = st.button("🔮 Predict Irrigation Requirement", type="primary")
     
     with col2:
-        st.markdown(f"""
-        <div class='metric-card'>
-            <h3>🌡️ Temperature</h3>
-            <h1>{temperature:.1f}°C</h1>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        st.markdown(f"""
-        <div class='metric-card'>
-            <h3>💨 Humidity</h3>
-            <h1>{humidity:.1f}%</h1>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    # Show initial message before prediction
-    if not predict_button and 'predictions' not in st.session_state:
-        st.markdown("""
-        <div style='text-align: center; padding: 50px; background-color: white; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
-            <h2>👈 Adjust the parameters in the sidebar</h2>
-            <p style='font-size: 18px; color: #7f8c8d;'>
-                Set the soil moisture, temperature, and air humidity values,<br>
-                then click <b>"🚀 PREDICT PUMP STATUS"</b> to get recommendations.
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-        return
-    
-    # Make predictions
-    if predict_button:
-        with st.spinner("🔮 Analyzing conditions with AI models..."):
-            predictions = make_predictions(models, soil_moisture, temperature, humidity)
-            st.session_state.predictions = predictions
-            st.session_state.inputs = {
-                'soil_moisture': soil_moisture,
-                'temperature': temperature,
-                'humidity': humidity
-            }
-    
-    if 'predictions' in st.session_state:
-        predictions = st.session_state.predictions
+        st.header("📈 Prediction Results")
         
-        # Find best model
-        best_model = max(predictions.keys(), key=lambda k: predictions[k]['confidence'])
-        best_confidence = predictions[best_model]['confidence']
-        best_prediction = predictions[best_model]['prediction']
-        
-        # Overall recommendation
-        st.markdown("## 🎯 Irrigation Recommendation")
-        
-        col_gauge, col_info = st.columns([1, 1])
-        
-        with col_gauge:
-            fig_gauge = plot_prediction_gauge(best_prediction, best_confidence)
-            st.plotly_chart(fig_gauge, use_container_width=True)
-        
-        with col_info:
-            if best_prediction == 1:
-                st.markdown(f"""
-                <div style='background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                            color: white; padding: 30px; border-radius: 15px; text-align: center;'>
-                    <h1>💧 IRRIGATION NEEDED</h1>
-                    <p style='font-size: 20px; margin: 20px 0;'>
-                        Turn the pump <b>ON</b>
-                    </p>
-                    <p style='font-size: 16px; opacity: 0.9;'>
-                        Best Model: <b>{best_model}</b><br>
-                        Confidence: <b>{best_confidence*100:.1f}%</b>
-                    </p>
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.markdown(f"""
-                <div style='background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); 
-                            color: white; padding: 30px; border-radius: 15px; text-align: center;'>
-                    <h1>🚫 NO IRRIGATION</h1>
-                    <p style='font-size: 20px; margin: 20px 0;'>
-                        Keep the pump <b>OFF</b>
-                    </p>
-                    <p style='font-size: 16px; opacity: 0.9;'>
-                        Best Model: <b>{best_model}</b><br>
-                        Confidence: <b>{best_confidence*100:.1f}%</b>
-                    </p>
-                </div>
-                """, unsafe_allow_html=True)
-        
-        st.markdown("---")
-        
-        # Tabs for different views
-        tab1, tab2, tab3 = st.tabs(["📊 Comparison Chart", "🔍 Detailed Results", "📈 Model Analysis"])
-        
-        with tab1:
-            st.plotly_chart(plot_confidence_comparison(predictions), use_container_width=True)
+        if predict_button:
+            # Prepare input data
+            input_data = np.array([[soil_moisture, temperature, humidity]])
             
-            # Legend
-            col_legend1, col_legend2 = st.columns(2)
-            with col_legend1:
-                st.markdown("🔴 **Quantum Models** - VQC (Variational Quantum Classifier)")
-            with col_legend2:
-                st.markdown("🔵 **Classical Models** - LR, SVM, Random Forest")
-        
-        with tab2:
-            st.markdown("### 🤖 Individual Model Predictions")
-            
-            for model_name, pred_info in predictions.items():
-                is_best = model_name == best_model
-                
-                if is_best:
-                    st.markdown(f"""
-                    <div class='highlight-best'>
-                        🏆 BEST MODEL: {model_name}
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with st.container():
-                    col_model, col_pred, col_conf = st.columns([2, 2, 2])
+            # Show loading animation
+            with st.spinner("🔄 Processing with hybrid quantum-classical model..."):
+                try:
+                    # Make prediction
+                    prediction = model.predict(input_data)[0]
+                    probabilities = model.predict_proba(input_data)[0]
                     
-                    with col_model:
-                        model_type_icon = "⚛️" if pred_info['type'] == 'quantum' else "🖥️"
-                        st.markdown(f"### {model_type_icon} {model_name}")
-                        st.caption(f"Type: {pred_info['type'].title()}")
+                    # Get confidence
+                    confidence = probabilities[prediction] * 100
                     
-                    with col_pred:
-                        if pred_info['prediction'] == 1:
-                            st.markdown("### 💧 **ON**")
-                            st.success("Irrigation Required")
-                        else:
-                            st.markdown("### 🚫 **OFF**")
-                            st.error("No Irrigation")
+                    # Display prediction
+                    st.markdown("### Prediction Result")
                     
-                    with col_conf:
-                        st.markdown("### 📊 Confidence")
-                        st.metric(
-                            label="",
-                            value=f"{pred_info['confidence']*100:.1f}%",
-                            delta=f"{(pred_info['confidence'] - 0.5)*100:+.1f}% vs random"
+                    if prediction == 1:
+                        st.markdown(
+                            f'<div class="prediction-box pump-on">'
+                            f'<h2>💧 PUMP ON</h2>'
+                            f'<p style="font-size: 18px;">Irrigation is required based on current conditions.</p>'
+                            f'</div>',
+                            unsafe_allow_html=True
                         )
-                
-                st.markdown("---")
-        
-        with tab3:
-            st.markdown("### 📈 Statistical Analysis")
+                    else:
+                        st.markdown(
+                            f'<div class="prediction-box pump-off">'
+                            f'<h2>🌤️ PUMP OFF</h2>'
+                            f'<p style="font-size: 18px;">No irrigation needed at this time.</p>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+                    
+                    # Display confidence gauge
+                    st.plotly_chart(
+                        create_confidence_gauge(confidence, prediction),
+                        use_container_width=True
+                    )
+                    
+                    # Display recommendation
+                    st.markdown("### 💡 Recommendation")
+                    recommendation = get_recommendation(
+                        prediction, confidence, soil_moisture, temperature, humidity
+                    )
+                    st.info(recommendation)
+                    
+                    # Display probabilities
+                    st.markdown("### 📊 Class Probabilities")
+                    prob_col1, prob_col2 = st.columns(2)
+                    with prob_col1:
+                        st.metric(
+                            "Pump OFF Probability",
+                            f"{probabilities[0]*100:.1f}%"
+                        )
+                    with prob_col2:
+                        st.metric(
+                            "Pump ON Probability",
+                            f"{probabilities[1]*100:.1f}%"
+                        )
+                    
+                except Exception as e:
+                    st.error(f"❌ Prediction error: {str(e)}")
+                    st.exception(e)
+        else:
+            st.info("👈 Adjust the input parameters and click **Predict** to get irrigation recommendations.")
             
-            # Create DataFrame for analysis
-            df_results = pd.DataFrame([
-                {
-                    'Model': name,
-                    'Type': info['type'].title(),
-                    'Prediction': 'ON' if info['prediction'] == 1 else 'OFF',
-                    'Confidence (%)': f"{info['confidence']*100:.2f}",
-                    'Probability (%)': f"{info['probability']*100:.2f}"
-                }
-                for name, info in predictions.items()
-            ])
-            
-            st.dataframe(
-                df_results,
-                use_container_width=True,
-                hide_index=True
-            )
-            
-            # Statistics
-            col_stat1, col_stat2, col_stat3 = st.columns(3)
-            
-            with col_stat1:
-                avg_confidence = np.mean([p['confidence'] for p in predictions.values()])
-                st.metric("Average Confidence", f"{avg_confidence*100:.1f}%")
-            
-            with col_stat2:
-                consensus = len([p for p in predictions.values() if p['prediction'] == best_prediction])
-                st.metric("Model Consensus", f"{consensus}/{len(predictions)}")
-            
-            with col_stat3:
-                quantum_models = len([p for p in predictions.values() if p['type'] == 'quantum'])
-                st.metric("Quantum Models", f"{quantum_models}")
-        
-        # Environmental insights
-        st.markdown("---")
-        st.markdown("## 🌍 Environmental Analysis")
-        
-        col_insight1, col_insight2, col_insight3 = st.columns(3)
-        
-        with col_insight1:
+            # Show example prediction
+            st.markdown("### 📝 Example Scenarios")
             st.markdown("""
-            <div class='info-box'>
-            <b>💧 Soil Moisture Analysis</b><br>
-            """, unsafe_allow_html=True)
+            **Scenario 1: Dry Conditions**
+            - Soil Moisture: 300
+            - Temperature: 35°C
+            - Humidity: 40%
+            - Expected: **PUMP ON** 💧
             
-            if soil_moisture < 500:
-                st.markdown("🔴 **Critical:** Very low soil moisture - High irrigation priority")
-            elif soil_moisture < 650:
-                st.markdown("🟡 **Moderate:** Below optimal moisture - Consider irrigation")
-            else:
-                st.markdown("🟢 **Good:** Adequate soil moisture - Low irrigation priority")
+            **Scenario 2: Wet Conditions**
+            - Soil Moisture: 850
+            - Temperature: 20°C
+            - Humidity: 80%
+            - Expected: **PUMP OFF** 🌤️
             
-            st.markdown("</div>", unsafe_allow_html=True)
-        
-        with col_insight2:
-            st.markdown("""
-            <div class='info-box'>
-            <b>🌡️ Temperature Analysis</b><br>
-            """, unsafe_allow_html=True)
-            
-            if temperature > 33:
-                st.markdown("🔴 **Hot:** High evaporation rate - Increased water needs")
-            elif temperature > 27:
-                st.markdown("🟡 **Warm:** Moderate water requirements")
-            else:
-                st.markdown("🟢 **Cool:** Lower evaporation - Reduced water needs")
-            
-            st.markdown("</div>", unsafe_allow_html=True)
-        
-        with col_insight3:
-            st.markdown("""
-            <div class='info-box'>
-            <b>💨 Humidity Analysis</b><br>
-            """, unsafe_allow_html=True)
-            
-            if humidity < 50:
-                st.markdown("🔴 **Dry:** Low humidity - Higher irrigation needs")
-            elif humidity < 65:
-                st.markdown("🟡 **Moderate:** Normal humidity levels")
-            else:
-                st.markdown("🟢 **Humid:** High moisture in air - Lower irrigation needs")
-            
-            st.markdown("</div>", unsafe_allow_html=True)
+            **Scenario 3: Moderate Conditions**
+            - Soil Moisture: 600
+            - Temperature: 25°C
+            - Humidity: 60%
+            - Prediction varies based on hybrid model
+            """)
     
-    # Footer
+    # Feature visualization
+    st.markdown("---")
+    st.header("📊 Input Feature Visualization")
+    st.plotly_chart(
+        create_feature_importance_chart(
+            CONFIG['feature_names'],
+            [soil_moisture, temperature, humidity]
+        ),
+        use_container_width=True
+    )
+    
+    # Additional information
     st.markdown("---")
     st.markdown("""
-    <div style='text-align: center; color: #95a5a6; padding: 20px;'>
-        <p><b>Quantum-Enhanced Smart Irrigation System</b></p>
-        <p>Powered by PennyLane, Scikit-learn & Streamlit</p>
-        <p>🌾 Optimizing water usage for sustainable agriculture 🌍</p>
+    ### 🔬 How It Works
+    
+    This application uses a **Hybrid Quantum-Classical Machine Learning Model** that combines:
+    
+    1. **Variational Quantum Classifier (VQC)**: Extracts quantum features from input data using quantum circuits
+    2. **Random Forest Classifier**: Processes both classical and quantum features for final prediction
+    
+    The hybrid approach leverages quantum computing's pattern recognition capabilities while maintaining 
+    the robustness of classical machine learning.
+    
+    ---
+    
+    ### 📖 Feature Descriptions
+    
+    - **Soil Moisture**: Sensor reading indicating soil water content (0 = very dry, 1000 = very wet)
+    - **Temperature**: Ambient air temperature affecting evaporation rates
+    - **Air Humidity**: Relative humidity affecting plant transpiration and water demand
+    
+    ---
+    
+    ### ⚙️ Technical Details
+    
+    - **Model Type**: Hybrid VQC + Random Forest
+    - **Quantum Qubits**: 4
+    - **Quantum Layers**: 3
+    - **RF Estimators**: 100
+    - **Training Accuracy**: Varies based on dataset
+    
+    ---
+    
+    <div style="text-align: center; padding: 2rem; background-color: #f3f4f6; border-radius: 10px; margin-top: 2rem;">
+        <p style="color: #6b7280; font-size: 14px; margin: 0;">
+            Developed by <strong>Smart Irrigation Team</strong> | Powered by Quantum Machine Learning
+        </p>
+        <p style="color: #9ca3af; font-size: 12px; margin-top: 0.5rem;">
+            © 2025 Hybrid Quantum-Classical Irrigation System | Version 1.0
+        </p>
     </div>
     """, unsafe_allow_html=True)
 
