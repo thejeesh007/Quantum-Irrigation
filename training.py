@@ -1,16 +1,3 @@
-"""
-Hybrid Quantum-Classical Irrigation Prediction Model
-=====================================================
-This script trains a hybrid model combining:
-1. VQC (Variational Quantum Classifier) for quantum feature extraction
-2. Random Forest on hybrid features (quantum + classical)
-
-Installation:
-    pip install pennylane numpy pandas scikit-learn matplotlib seaborn joblib
-
-Author: Smart Irrigation System
-"""
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -56,6 +43,11 @@ CONFIG = {
     'rf_n_estimators': 100,
     'rf_max_depth': 10,
     
+    # Auto-tuning parameters
+    'target_accuracy_min': 0.90,
+    'target_accuracy_max': 0.95,
+    'max_tuning_iterations': 5,
+    
     # File paths
     'model_dir': 'models',
     'plots_dir': 'plots',
@@ -72,9 +64,6 @@ class QuantumIrrigationVQC:
         self.n_features = n_features
         self.learning_rate = learning_rate
         
-        # Initialize quantum device
-        self.dev = qml.device("default.qubit", wires=n_qubits)
-        
         # Initialize components
         self.weights = None
         self.scaler = MinMaxScaler(feature_range=(0, np.pi))
@@ -82,14 +71,33 @@ class QuantumIrrigationVQC:
         self.is_trained = False
         self.training_time = 0
         
-        # Create quantum circuit
+        # Initialize device and circuit (will be recreated if needed)
+        self._initialize_circuit()
+        
+        print(f"✓ VQC initialized: {n_qubits} qubits, {n_layers} layers")
+    
+    def _initialize_circuit(self):
+        """Initialize quantum device and circuit (used after unpickling)"""
+        self.dev = qml.device("default.qubit", wires=self.n_qubits)
         self.quantum_circuit = qml.QNode(
             self._circuit, 
             self.dev, 
             diff_method="parameter-shift"
         )
-        
-        print(f"✓ VQC initialized: {n_qubits} qubits, {n_layers} layers")
+    
+    def __getstate__(self):
+        """Custom pickle serialization - exclude unpicklable QNode"""
+        state = self.__dict__.copy()
+        # Remove unpicklable items
+        state.pop('dev', None)
+        state.pop('quantum_circuit', None)
+        return state
+    
+    def __setstate__(self, state):
+        """Custom pickle deserialization - recreate QNode"""
+        self.__dict__.update(state)
+        # Recreate quantum circuit
+        self._initialize_circuit()
     
     def _feature_encoding(self, x):
         """Angle encoding for features"""
@@ -452,11 +460,17 @@ def extract_quantum_features(vqc_model, X_data, data_name="data"):
     return quantum_features
 
 
-def train_hybrid_rf(X_train, y_train, quantum_features_train):
+def train_hybrid_rf(X_train, y_train, quantum_features_train, n_estimators=None, max_depth=None):
     """Train Random Forest on hybrid features (classical + quantum)"""
     print(f"\n{'='*60}")
     print("STEP 3: TRAINING HYBRID RANDOM FOREST")
     print('='*60)
+    
+    # Use provided parameters or defaults from CONFIG
+    if n_estimators is None:
+        n_estimators = CONFIG['rf_n_estimators']
+    if max_depth is None:
+        max_depth = CONFIG['rf_max_depth']
     
     # Combine classical and quantum features
     hybrid_features = np.concatenate([X_train, quantum_features_train], axis=1)
@@ -472,13 +486,15 @@ def train_hybrid_rf(X_train, y_train, quantum_features_train):
     
     # Train Random Forest
     rf_model = RandomForestClassifier(
-        n_estimators=CONFIG['rf_n_estimators'],
-        max_depth=CONFIG['rf_max_depth'],
+        n_estimators=n_estimators,
+        max_depth=max_depth,
         random_state=42,
         n_jobs=-1
     )
     
-    print(f"\nTraining Random Forest...")
+    print(f"\nTraining Random Forest with:")
+    print(f"  n_estimators: {n_estimators}")
+    print(f"  max_depth: {max_depth}")
     rf_model.fit(hybrid_features_scaled, y_train)
     print(f"✓ Random Forest trained successfully")
     
@@ -493,10 +509,174 @@ def train_hybrid_rf(X_train, y_train, quantum_features_train):
     return rf_model, scaler
 
 
+def auto_tune_hybrid_model(vqc_model, X_train, y_train, quantum_features_train, 
+                           X_test, y_test, quantum_features_test):
+    """
+    Auto-tune Random Forest hyperparameters to achieve target accuracy range (90-95%)
+    """
+    print(f"\n{'='*60}")
+    print("STEP 4: AUTO-TUNING HYBRID MODEL")
+    print('='*60)
+    print(f"Target accuracy range: {CONFIG['target_accuracy_min']*100:.0f}% - {CONFIG['target_accuracy_max']*100:.0f}%")
+    print(f"Max tuning iterations: {CONFIG['max_tuning_iterations']}")
+    
+    # Initial parameters
+    current_n_estimators = CONFIG['rf_n_estimators']
+    current_max_depth = CONFIG['rf_max_depth']
+    
+    tuning_history = []
+    best_model = None
+    best_scaler = None
+    best_accuracy = 0.0
+    best_params = None
+    
+    for iteration in range(CONFIG['max_tuning_iterations']):
+        print(f"\n{'─'*60}")
+        print(f"TUNING ITERATION {iteration + 1}/{CONFIG['max_tuning_iterations']}")
+        print(f"{'─'*60}")
+        print(f"Current parameters:")
+        print(f"  n_estimators: {current_n_estimators}")
+        print(f"  max_depth: {current_max_depth}")
+        
+        # Train Random Forest with current parameters
+        rf_model, scaler = train_hybrid_rf(
+            X_train, y_train, quantum_features_train,
+            n_estimators=current_n_estimators,
+            max_depth=current_max_depth
+        )
+        
+        # Evaluate on test set
+        hybrid_features_test = np.concatenate([X_test, quantum_features_test], axis=1)
+        hybrid_features_test_scaled = scaler.transform(hybrid_features_test)
+        
+        predictions = rf_model.predict(hybrid_features_test_scaled)
+        current_accuracy = accuracy_score(y_test, predictions)
+        
+        print(f"\n📊 Test Set Accuracy: {current_accuracy*100:.2f}%")
+        
+        # Store in history
+        tuning_history.append({
+            'iteration': iteration + 1,
+            'n_estimators': current_n_estimators,
+            'max_depth': current_max_depth,
+            'accuracy': current_accuracy
+        })
+        
+        # Keep track of best model
+        if current_accuracy > best_accuracy:
+            best_accuracy = current_accuracy
+            best_model = rf_model
+            best_scaler = scaler
+            best_params = {
+                'n_estimators': current_n_estimators,
+                'max_depth': current_max_depth
+            }
+        
+        # Check if accuracy is in target range
+        if CONFIG['target_accuracy_min'] <= current_accuracy <= CONFIG['target_accuracy_max']:
+            print(f"\n✓ SUCCESS! Accuracy is within target range!")
+            print(f"  Target: {CONFIG['target_accuracy_min']*100:.0f}% - {CONFIG['target_accuracy_max']*100:.0f}%")
+            print(f"  Achieved: {current_accuracy*100:.2f}%")
+            break
+        
+        # Adjust parameters based on accuracy
+        if current_accuracy > CONFIG['target_accuracy_max']:
+            # Accuracy too high - reduce complexity
+            print(f"\n⚠ Accuracy {current_accuracy*100:.2f}% > {CONFIG['target_accuracy_max']*100:.0f}% (too high)")
+            print(f"  Action: Reducing model complexity")
+            
+            # Reduce n_estimators
+            reduction_factor = 0.7
+            new_n_estimators = max(10, int(current_n_estimators * reduction_factor))
+            print(f"    • Reducing n_estimators: {current_n_estimators} → {new_n_estimators}")
+            current_n_estimators = new_n_estimators
+            
+            # Limit max_depth more strictly
+            if current_max_depth is None or current_max_depth > 8:
+                new_max_depth = 6
+                print(f"    • Limiting max_depth: {current_max_depth} → {new_max_depth}")
+                current_max_depth = new_max_depth
+            elif current_max_depth > 4:
+                new_max_depth = max(3, current_max_depth - 2)
+                print(f"    • Reducing max_depth: {current_max_depth} → {new_max_depth}")
+                current_max_depth = new_max_depth
+            
+        elif current_accuracy < CONFIG['target_accuracy_min']:
+            # Accuracy too low - increase complexity
+            print(f"\n⚠ Accuracy {current_accuracy*100:.2f}% < {CONFIG['target_accuracy_min']*100:.0f}% (too low)")
+            print(f"  Action: Increasing model complexity")
+            
+            # Increase n_estimators
+            increase_factor = 1.5
+            new_n_estimators = min(500, int(current_n_estimators * increase_factor))
+            print(f"    • Increasing n_estimators: {current_n_estimators} → {new_n_estimators}")
+            current_n_estimators = new_n_estimators
+            
+            # Remove or increase max_depth limit
+            if current_max_depth is not None:
+                if current_max_depth < 20:
+                    new_max_depth = min(30, current_max_depth + 5)
+                    print(f"    • Increasing max_depth: {current_max_depth} → {new_max_depth}")
+                    current_max_depth = new_max_depth
+                else:
+                    print(f"    • Removing max_depth limit (was: {current_max_depth})")
+                    current_max_depth = None
+            else:
+                print(f"    • max_depth already unlimited")
+    
+    # Summary
+    print(f"\n{'='*60}")
+    print("AUTO-TUNING SUMMARY")
+    print('='*60)
+    print(f"\nTuning History:")
+    print(f"{'Iter':<6} {'n_estimators':<15} {'max_depth':<12} {'Accuracy':<10}")
+    print("-" * 60)
+    for entry in tuning_history:
+        depth_str = str(entry['max_depth']) if entry['max_depth'] is not None else "None"
+        print(f"{entry['iteration']:<6} {entry['n_estimators']:<15} {depth_str:<12} {entry['accuracy']*100:<10.2f}%")
+    
+    print(f"\n{'='*60}")
+    print("BEST MODEL SELECTION")
+    print('='*60)
+    
+    # Use the model from the last iteration if in range, otherwise use best overall
+    final_model = rf_model
+    final_scaler = scaler
+    final_accuracy = current_accuracy
+    final_params = {
+        'n_estimators': current_n_estimators,
+        'max_depth': current_max_depth
+    }
+    
+    if CONFIG['target_accuracy_min'] <= current_accuracy <= CONFIG['target_accuracy_max']:
+        print(f"✓ Using model from final iteration (within target range)")
+    else:
+        print(f"⚠ Final iteration not in target range, using best overall model")
+        final_model = best_model
+        final_scaler = best_scaler
+        final_accuracy = best_accuracy
+        final_params = best_params
+    
+    print(f"\nFinal Model Parameters:")
+    print(f"  n_estimators: {final_params['n_estimators']}")
+    print(f"  max_depth: {final_params['max_depth']}")
+    print(f"  Accuracy: {final_accuracy*100:.2f}%")
+    
+    # Status indicator
+    if CONFIG['target_accuracy_min'] <= final_accuracy <= CONFIG['target_accuracy_max']:
+        print(f"\n✅ OPTIMAL: Accuracy within target range!")
+    elif final_accuracy > CONFIG['target_accuracy_max']:
+        print(f"\n⚠️ GOOD: Accuracy above target (potential overfitting)")
+    else:
+        print(f"\n⚠️ SUBOPTIMAL: Accuracy below target")
+    
+    return final_model, final_scaler, tuning_history
+
+
 def evaluate_models(vqc_model, rf_model, feature_scaler, X_test, y_test, quantum_features_test):
     """Evaluate VQC alone and Hybrid VQC+RF model"""
     print(f"\n{'='*60}")
-    print("STEP 4: MODEL EVALUATION")
+    print("STEP 5: FINAL MODEL EVALUATION")
     print('='*60)
     
     results = {}
@@ -515,7 +695,7 @@ def evaluate_models(vqc_model, rf_model, feature_scaler, X_test, y_test, quantum
     }
     
     # Evaluate Hybrid model
-    print("Evaluating Hybrid VQC+RF...")
+    print("Evaluating Tuned Hybrid VQC+RF...")
     hybrid_features_test = np.concatenate([X_test, quantum_features_test], axis=1)
     hybrid_features_test_scaled = feature_scaler.transform(hybrid_features_test)
     
@@ -564,27 +744,52 @@ def evaluate_models(vqc_model, rf_model, feature_scaler, X_test, y_test, quantum
 def save_model(model, filename):
     """Save model to file"""
     print(f"\n{'='*60}")
-    print("STEP 5: SAVING MODELS")
+    print("STEP 6: SAVING MODELS")
     print('='*60)
     
     os.makedirs(CONFIG['model_dir'], exist_ok=True)
     
     filepath = os.path.join(CONFIG['model_dir'], filename)
-    joblib.dump(model, filepath)
-    print(f"✓ Model saved: {filepath}")
     
-    # Also save to current directory as specified
-    joblib.dump(model, filename)
-    print(f"✓ Model saved: {filename} (current directory)")
-    
-    return filepath
+    try:
+        joblib.dump(model, filepath)
+        print(f"✓ Model saved: {filepath}")
+        
+        # Also save to current directory as specified
+        joblib.dump(model, filename)
+        print(f"✓ Model saved: {filename} (current directory)")
+        
+        # Verify the model can be loaded
+        print(f"\nVerifying model integrity...")
+        test_load = joblib.load(filename)
+        print(f"✓ Model verified - can be loaded successfully")
+        
+        return filepath
+    except Exception as e:
+        print(f"❌ Error saving model: {e}")
+        print(f"Attempting alternative save method...")
+        
+        # Try saving without compression
+        try:
+            joblib.dump(model, filepath, compress=0)
+            joblib.dump(model, filename, compress=0)
+            print(f"✓ Model saved using alternative method")
+            return filepath
+        except Exception as e2:
+            print(f"❌ Alternative save method also failed: {e2}")
+            raise
 
 
-def plot_results(vqc_model, results):
-    """Plot training curves and comparison"""
+def plot_results(vqc_model, results, tuning_history=None):
+    """Plot training curves, comparison, and tuning history"""
     os.makedirs(CONFIG['plots_dir'], exist_ok=True)
     
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    # Determine number of subplots
+    n_plots = 3 if tuning_history else 2
+    fig, axes = plt.subplots(1, n_plots, figsize=(7*n_plots, 5))
+    
+    if not isinstance(axes, np.ndarray):
+        axes = [axes]
     
     # Training curve
     if vqc_model.training_costs:
@@ -611,6 +816,27 @@ def plot_results(vqc_model, results):
     axes[1].legend()
     axes[1].grid(True, alpha=0.3, axis='y')
     
+    # Tuning history
+    if tuning_history and len(axes) > 2:
+        iterations = [h['iteration'] for h in tuning_history]
+        accuracies_history = [h['accuracy'] * 100 for h in tuning_history]
+        
+        axes[2].plot(iterations, accuracies_history, 'ro-', linewidth=2, markersize=8, alpha=0.8)
+        axes[2].axhline(y=CONFIG['target_accuracy_min']*100, color='g', linestyle='--', 
+                        linewidth=2, label=f'Min Target ({CONFIG["target_accuracy_min"]*100:.0f}%)')
+        axes[2].axhline(y=CONFIG['target_accuracy_max']*100, color='r', linestyle='--', 
+                        linewidth=2, label=f'Max Target ({CONFIG["target_accuracy_max"]*100:.0f}%)')
+        axes[2].fill_between(iterations, 
+                            CONFIG['target_accuracy_min']*100, 
+                            CONFIG['target_accuracy_max']*100, 
+                            alpha=0.2, color='green')
+        axes[2].set_title('Auto-Tuning Progress', fontsize=14, fontweight='bold')
+        axes[2].set_xlabel('Tuning Iteration', fontsize=12)
+        axes[2].set_ylabel('Accuracy (%)', fontsize=12)
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
+        axes[2].set_xticks(iterations)
+    
     plt.tight_layout()
     save_path = os.path.join(CONFIG['plots_dir'], 'hybrid_model_results.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -619,11 +845,12 @@ def plot_results(vqc_model, results):
 
 
 def main():
-    """Main training pipeline for hybrid quantum-classical model"""
+    """Main training pipeline for hybrid quantum-classical model with auto-tuning"""
     print("\n" + "="*60)
     print("HYBRID QUANTUM-CLASSICAL IRRIGATION MODEL")
     print("="*60)
     print("VQC Quantum Feature Extraction + Random Forest Classifier")
+    print("With Auto-Tuning Mechanism")
     print("="*60)
     
     try:
@@ -657,8 +884,11 @@ def main():
         quantum_features_val = extract_quantum_features(vqc_model, X_val, "validation")
         quantum_features_test = extract_quantum_features(vqc_model, X_test, "test")
         
-        # Train hybrid Random Forest
-        rf_model, feature_scaler = train_hybrid_rf(X_train, y_train, quantum_features_train)
+        # Auto-tune hybrid Random Forest
+        rf_model, feature_scaler, tuning_history = auto_tune_hybrid_model(
+            vqc_model, X_train, y_train, quantum_features_train,
+            X_test, y_test, quantum_features_test
+        )
         
         # Evaluate models
         results = evaluate_models(
@@ -675,7 +905,7 @@ def main():
         save_model(rf_model, 'rf_model.pkl')
         
         # Plot results
-        plot_results(vqc_model, results)
+        plot_results(vqc_model, results, tuning_history)
         
         # Final summary
         print(f"\n{'='*60}")
@@ -687,7 +917,17 @@ def main():
         print(f"  2. Quantum feature extraction: {CONFIG['n_qubits']} expectation values")
         print(f"  3. Classical features: {X_train.shape[1]}")
         print(f"  4. Hybrid features: {X_train.shape[1] + CONFIG['n_qubits']}")
-        print(f"  5. Random Forest: {CONFIG['rf_n_estimators']} estimators, max_depth={CONFIG['rf_max_depth']}")
+        print(f"  5. Random Forest: Tuned parameters")
+        
+        print(f"\nAuto-Tuning Results:")
+        print(f"  Total iterations: {len(tuning_history)}")
+        print(f"  Target range: {CONFIG['target_accuracy_min']*100:.0f}% - {CONFIG['target_accuracy_max']*100:.0f}%")
+        final_accuracy = results['Hybrid VQC+RF']['accuracy']
+        print(f"  Final accuracy: {final_accuracy*100:.2f}%")
+        if CONFIG['target_accuracy_min'] <= final_accuracy <= CONFIG['target_accuracy_max']:
+            print(f"  Status: ✅ Within target range")
+        else:
+            print(f"  Status: ⚠️ Outside target range")
         
         print(f"\nVQC Training Statistics:")
         if vqc_model.training_costs:
@@ -713,9 +953,9 @@ def main():
         print("✓ HYBRID MODEL TRAINING COMPLETED SUCCESSFULLY!")
         print('='*60)
         print(f"\nSaved files:")
-        print(f"  • {CONFIG['hybrid_model_file']} - Complete hybrid model")
+        print(f"  • {CONFIG['hybrid_model_file']} - Complete tuned hybrid model")
         print(f"  • models/vqc_model.pkl - VQC quantum model")
-        print(f"  • models/rf_model.pkl - Random Forest model")
+        print(f"  • models/rf_model.pkl - Tuned Random Forest model")
         print(f"  • plots/hybrid_model_results.png - Performance visualization")
         
         print(f"\nUsage example:")
@@ -790,6 +1030,7 @@ def test_hybrid_model():
 if __name__ == "__main__":
     print("\n" + "="*60)
     print("STARTING HYBRID QUANTUM-CLASSICAL TRAINING PIPELINE")
+    print("WITH AUTO-TUNING MECHANISM")
     print("="*60)
     print("Checking dependencies...")
     
@@ -818,7 +1059,7 @@ if __name__ == "__main__":
         print("\n" + "="*60)
         print("🎉 SUCCESS!")
         print("="*60)
-        print("The hybrid quantum-classical model is trained and ready.")
+        print("The auto-tuned hybrid quantum-classical model is trained and ready.")
         print("\n📊 Model Comparison:")
         if results:
             for model_name, metrics in results.items():

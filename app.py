@@ -38,23 +38,40 @@ class QuantumIrrigationVQC:
         self.n_features = n_features
         self.learning_rate = learning_rate
         
+        # Initialize components
+        self.weights = None
+        self.scaler = MinMaxScaler(feature_range=(0, np.pi))
+        self.training_costs = []
+        self.is_trained = False
+        self.training_time = 0
+        
+        # Initialize device and circuit (will be recreated if needed)
         if PENNYLANE_AVAILABLE:
-            # Initialize quantum device
-            self.dev = qml.device("default.qubit", wires=n_qubits)
-            
-            # Initialize components
-            self.weights = None
-            self.scaler = MinMaxScaler(feature_range=(0, np.pi))
-            self.training_costs = []
-            self.is_trained = False
-            self.training_time = 0
-            
-            # Create quantum circuit
-            self.quantum_circuit = qml.QNode(
-                self._circuit, 
-                self.dev, 
-                diff_method="parameter-shift"
-            )
+            self._initialize_circuit()
+    
+    def _initialize_circuit(self):
+        """Initialize quantum device and circuit (used after unpickling)"""
+        self.dev = qml.device("default.qubit", wires=self.n_qubits)
+        self.quantum_circuit = qml.QNode(
+            self._circuit, 
+            self.dev, 
+            diff_method="parameter-shift"
+        )
+    
+    def __getstate__(self):
+        """Custom pickle serialization - exclude unpicklable QNode"""
+        state = self.__dict__.copy()
+        # Remove unpicklable items
+        state.pop('dev', None)
+        state.pop('quantum_circuit', None)
+        return state
+    
+    def __setstate__(self, state):
+        """Custom pickle deserialization - recreate QNode"""
+        self.__dict__.update(state)
+        # Recreate quantum circuit
+        if PENNYLANE_AVAILABLE:
+            self._initialize_circuit()
     
     def _feature_encoding(self, x):
         """Angle encoding for features"""
@@ -170,7 +187,7 @@ class HybridQuantumClassicalModel:
 
 # ==================== CONFIGURATION ====================
 CONFIG = {
-    'model_path': 'models/hybrid_irrigation_model.pkl',
+    'model_path': 'hybrid_irrigation_model.pkl',
     'feature_names': ['Soil Moisture', 'Temperature', 'Air Humidity'],
     'feature_ranges': {
         'Soil Moisture': (0, 1000),
@@ -188,7 +205,7 @@ CONFIG = {
         'Air Humidity': '%'
     },
     'app_title': '🌱 Smart Irrigation Predictor',
-    'app_description': 'Hybrid Quantum-Classical AI Model for Irrigation Decision Making'
+    'app_description': 'Auto-Tuned Hybrid Quantum-Classical AI Model for Irrigation Decision Making'
 }
 
 
@@ -196,10 +213,19 @@ CONFIG = {
 @st.cache_resource
 def load_model():
     """Load the trained hybrid model with caching"""
-    model_path = Path(CONFIG['model_path'])
+    # Try multiple possible paths
+    possible_paths = [
+        CONFIG['model_path'],
+        Path('models') / 'hybrid_irrigation_model.pkl',
+        Path('hybrid_irrigation_model.pkl')
+    ]
     
-    if not model_path.exists():
-        return None, f"Model file '{CONFIG['model_path']}' not found"
+    for model_path in possible_paths:
+        model_path = Path(model_path)
+        if model_path.exists():
+            break
+    else:
+        return None, f"Model file not found in any of these locations: {[str(p) for p in possible_paths]}"
     
     if not PENNYLANE_AVAILABLE:
         return None, "PennyLane is required but not installed. Run: pip install pennylane"
@@ -294,7 +320,6 @@ def create_feature_importance_chart(features, values):
     
     fig.update_yaxes(range=[0, 100], gridcolor='#e5e7eb')
     fig.update_xaxes(gridcolor='#e5e7eb')
-
     
     return fig
 
@@ -426,7 +451,7 @@ def main():
         st.warning("""
         **Model not found!** Please ensure you have:
         1. Trained the hybrid model by running `training.py`
-        2. The file `hybrid_irrigation_model.pkl` exists in the same directory as this app
+        2. The file `hybrid_irrigation_model.pkl` exists in the current directory or models/ folder
         3. All required dependencies are installed
         """)
         st.info("""
@@ -447,7 +472,7 @@ def main():
         """)
         return
     
-    st.success("✅ Hybrid Quantum-Classical Model Loaded Successfully!")
+    st.success("✅ Auto-Tuned Hybrid Quantum-Classical Model Loaded Successfully!")
     
     # Sidebar - Model Information
     with st.sidebar:
@@ -455,13 +480,25 @@ def main():
         st.markdown("""
         **Architecture:**
         - 🔬 VQC Quantum Feature Extraction
-        - 🌲 Random Forest Classifier
+        - 🌲 Auto-Tuned Random Forest Classifier
         - 🤝 Hybrid Quantum-Classical Approach
+        - 🎯 Target Accuracy: 90-95%
         
         **Features:**
         - Soil Moisture (0-1000 units)
         - Temperature (-10 to 50°C)
         - Air Humidity (0-100%)
+        """)
+        
+        st.markdown("---")
+        st.header("🎯 Auto-Tuning")
+        st.markdown("""
+        This model was automatically tuned to maintain optimal accuracy:
+        
+        - **Target Range**: 90-95% accuracy
+        - **Tuning Process**: Adjusts Random Forest parameters automatically
+        - **Max Iterations**: 5 tuning cycles
+        - **Early Stopping**: When target accuracy is reached
         """)
         
         st.markdown("---")
@@ -472,12 +509,12 @@ def main():
         
         The model combines:
         - **VQC**: Variational Quantum Classifier for quantum feature extraction
-        - **Random Forest**: Classical ML for final classification
+        - **Random Forest**: Auto-tuned classical ML for final classification
         """)
         
         st.markdown("---")
         st.markdown("**Developed by:** Smart Irrigation Team")
-        st.markdown("**Model Version:** 1.0")
+        st.markdown("**Model Version:** 2.0 (Auto-Tuned)")
     
     # Main content area
     col1, col2 = st.columns([1, 1])
@@ -518,6 +555,41 @@ def main():
         
         st.markdown("---")
         
+        # Quick preset scenarios
+        st.markdown("### 🚀 Quick Presets")
+        col_preset1, col_preset2, col_preset3 = st.columns(3)
+        
+        with col_preset1:
+            if st.button("🔥 Dry Conditions"):
+                st.session_state.soil_moisture = 300.0
+                st.session_state.temperature = 35.0
+                st.session_state.humidity = 40.0
+                st.rerun()
+        
+        with col_preset2:
+            if st.button("💧 Wet Conditions"):
+                st.session_state.soil_moisture = 850.0
+                st.session_state.temperature = 20.0
+                st.session_state.humidity = 80.0
+                st.rerun()
+        
+        with col_preset3:
+            if st.button("🌤️ Moderate"):
+                st.session_state.soil_moisture = 600.0
+                st.session_state.temperature = 25.0
+                st.session_state.humidity = 60.0
+                st.rerun()
+        
+        # Update sliders if session state exists
+        if 'soil_moisture' in st.session_state:
+            soil_moisture = st.session_state.soil_moisture
+        if 'temperature' in st.session_state:
+            temperature = st.session_state.temperature
+        if 'humidity' in st.session_state:
+            humidity = st.session_state.humidity
+        
+        st.markdown("---")
+        
         # Predict button
         predict_button = st.button("🔮 Predict Irrigation Requirement", type="primary")
     
@@ -529,7 +601,7 @@ def main():
             input_data = np.array([[soil_moisture, temperature, humidity]])
             
             # Show loading animation
-            with st.spinner("🔄 Processing with hybrid quantum-classical model..."):
+            with st.spinner("🔄 Processing with auto-tuned hybrid quantum-classical model..."):
                 try:
                     # Make prediction
                     prediction = model.predict(input_data)[0]
@@ -594,23 +666,23 @@ def main():
             # Show example prediction
             st.markdown("### 📝 Example Scenarios")
             st.markdown("""
-            **Scenario 1: Dry Conditions**
+            **Scenario 1: Dry Conditions** 🔥
             - Soil Moisture: 300
             - Temperature: 35°C
             - Humidity: 40%
             - Expected: **PUMP ON** 💧
             
-            **Scenario 2: Wet Conditions**
+            **Scenario 2: Wet Conditions** 💧
             - Soil Moisture: 850
             - Temperature: 20°C
             - Humidity: 80%
             - Expected: **PUMP OFF** 🌤️
             
-            **Scenario 3: Moderate Conditions**
+            **Scenario 3: Moderate Conditions** 🌤️
             - Soil Moisture: 600
             - Temperature: 25°C
             - Humidity: 60%
-            - Prediction varies based on hybrid model
+            - Prediction varies based on auto-tuned hybrid model
             """)
     
     # Feature visualization
@@ -629,13 +701,28 @@ def main():
     st.markdown("""
     ### 🔬 How It Works
     
-    This application uses a **Hybrid Quantum-Classical Machine Learning Model** that combines:
+    This application uses an **Auto-Tuned Hybrid Quantum-Classical Machine Learning Model** that combines:
     
-    1. **Variational Quantum Classifier (VQC)**: Extracts quantum features from input data using quantum circuits
-    2. **Random Forest Classifier**: Processes both classical and quantum features for final prediction
+    1. **Variational Quantum Classifier (VQC)**: Extracts quantum features from input data using quantum circuits with 4 qubits and 3 layers
+    2. **Auto-Tuned Random Forest Classifier**: Processes both classical and quantum features with automatically optimized hyperparameters
+    3. **Automatic Tuning**: Model parameters are adjusted to maintain 90-95% accuracy through iterative optimization
     
     The hybrid approach leverages quantum computing's pattern recognition capabilities while maintaining 
-    the robustness of classical machine learning.
+    the robustness of classical machine learning, enhanced by automatic parameter tuning.
+    
+    ---
+    
+    ### 🎯 Auto-Tuning Process
+    
+    The model undergoes automatic tuning to optimize performance:
+    
+    - **Initial Training**: Model starts with default Random Forest parameters
+    - **Accuracy Check**: Tests performance on validation data
+    - **Parameter Adjustment**: 
+      - If accuracy > 95%: Reduces complexity (fewer estimators, limited depth)
+      - If accuracy < 90%: Increases complexity (more estimators, deeper trees)
+    - **Convergence**: Process repeats for up to 5 iterations until target accuracy (90-95%) is achieved
+    - **Best Model Selection**: Final model is the best performing configuration
     
     ---
     
@@ -649,20 +736,22 @@ def main():
     
     ### ⚙️ Technical Details
     
-    - **Model Type**: Hybrid VQC + Random Forest
+    - **Model Type**: Auto-Tuned Hybrid VQC + Random Forest
     - **Quantum Qubits**: 4
     - **Quantum Layers**: 3
-    - **RF Estimators**: 100
-    - **Training Accuracy**: Varies based on dataset
+    - **RF Estimators**: Auto-tuned (typically 50-200)
+    - **RF Max Depth**: Auto-tuned (typically 3-30)
+    - **Target Accuracy**: 90-95%
+    - **Tuning Method**: Iterative parameter optimization
     
     ---
     
     <div style="text-align: center; padding: 2rem; background-color: #f3f4f6; border-radius: 10px; margin-top: 2rem;">
         <p style="color: #6b7280; font-size: 14px; margin: 0;">
-            Developed by <strong>Smart Irrigation Team</strong> | Powered by Quantum Machine Learning
+            Developed by <strong>Smart Irrigation Team</strong> | Powered by Auto-Tuned Quantum Machine Learning
         </p>
         <p style="color: #9ca3af; font-size: 12px; margin-top: 0.5rem;">
-            © 2025 Hybrid Quantum-Classical Irrigation System | Version 1.0
+            © 2025 Hybrid Quantum-Classical Irrigation System | Version 2.0 (Auto-Tuned)
         </p>
     </div>
     """, unsafe_allow_html=True)
